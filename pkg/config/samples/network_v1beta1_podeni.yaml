@@ -1,0 +1,6 @@
+apiVersion: network.msxf.com/v1beta1
+kind: PodENI
+metadata:
+  name: podeni-sample
+spec:
+  # TODO(user): Add fields here

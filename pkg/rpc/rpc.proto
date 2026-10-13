@@ -1,0 +1,88 @@
+syntax = "proto3";
+package rpc;
+option go_package = "./;rpc";
+
+service LiraBackend {
+  rpc AllocIP (AllocIPRequest) returns (AllocIPReply) {
+  }
+  rpc ReleaseIP (ReleaseIPRequest) returns (ReleaseIPReply) {
+  }
+  rpc RecordEvent(EventRequest) returns (EventReply) {
+  }
+}
+
+// IPSet declare a string set contain v4 v6 info
+message IPSet {
+  string IPv4 = 1;
+  string IPv6 = 2;
+}
+
+message AllocIPRequest {
+  string K8sPodName = 1;
+  string K8sPodNamespace = 2;
+  string K8sPodInfraContainerId = 3;
+  string Netns = 4;
+}
+
+message NetConf {
+  BasicInfo BasicInfo = 1;
+}
+
+message AllocIPReply {
+  bool Success = 1;
+  bool IPv4 = 2;
+  bool IPv6 = 3;
+  NetConf NetConfs = 4;
+}
+
+message BasicInfo {
+  IPSet PodIP = 1;
+  IPSet PodCIDR = 2; // subnet for pod
+  IPSet ServiceCIDR =3;
+  string MAC = 4;
+  IPSet GatewayIP = 5;
+  string NodeIP = 6;
+}
+
+message ReleaseIPRequest {
+  string K8sPodName = 1;
+  string K8sPodNamespace = 2;
+  string K8sPodInfraContainerId = 3;
+  IPSet IPv4Addr = 4;
+  string MacAddr = 5;
+}
+
+message ReleaseIPReply {
+  bool Success = 1;
+  bool IPv4 = 4;
+  bool IPv6 = 5;
+}
+
+enum Error {
+  ErrNoErr = 0;
+  ErrCRDNotFound = 1;
+}
+
+enum EventTarget {
+  EventTargetNode = 0;
+  EventTargetPod = 1;
+}
+
+enum EventType {
+  EventTypeNormal = 0;
+  EventTypeWarning = 1;
+}
+
+message EventRequest {
+  EventTarget EventTarget = 1;
+  string K8sPodName = 2;
+  string K8sPodNamespace = 3;
+  EventType EventType = 4;
+  string Reason = 5;
+  string Message = 6;
+}
+
+message EventReply {
+  bool Succeed = 1;
+  string Error = 2;
+}

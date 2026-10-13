@@ -1,0 +1,9 @@
+{
+    "name":"lira",
+    "cniVersion":"0.3.1",
+    "plugins":[
+        {
+            "type":"lira"
+        }
+    ]
+}

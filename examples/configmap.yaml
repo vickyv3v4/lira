@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: msconfig
+  namespace: kube-system
+data:
+  mscloud_conf: |
+    {
+      "tenantId":"",
+      "cloudAccountId":"",
+      "regionCode": "",
+      "azoneCode": "",
+      "vpcId": "",
+      "subnetId": "",
+      "securityGroups": ["xx","uu"],
+      "resourceGroup": "",
+      "ownerType": "",
+      "serviceCidr": "",
+      "nodeENINum": ""
+    }

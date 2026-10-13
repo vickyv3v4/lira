@@ -1,0 +1,32 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - network.msxf.com
+  resources:
+  - podenis
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - network.msxf.com
+  resources:
+  - podenis/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - network.msxf.com
+  resources:
+  - podenis/status
+  verbs:
+  - get
+  - patch
+  - update

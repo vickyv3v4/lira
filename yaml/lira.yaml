@@ -1,0 +1,341 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.14.0
+  name: podenis.network.msxf.com
+spec:
+  group: network.msxf.com
+  names:
+    kind: PodENI
+    listKind: PodENIList
+    plural: podenis
+    singular: podeni
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.eni.id
+      name: ENIID
+      type: string
+    - jsonPath: .status.nodeName
+      name: Node
+      type: string
+    - jsonPath: .spec.eni.ipAddress
+      name: IP
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        description: PodENI is the Schema for the podenis API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PodENISpec defines the desired state of PodENI
+            properties:
+              eni:
+                properties:
+                  description:
+                    type: string
+                  gatewayIP:
+                    type: string
+                  id:
+                    type: string
+                  ipAddress:
+                    type: string
+                  macAddress:
+                    type: string
+                  name:
+                    type: string
+                  podCidr:
+                    type: string
+                  securityGroups:
+                    items:
+                      type: string
+                    type: array
+                  serviceCidr:
+                    type: string
+                type: object
+              nodeIP:
+                type: string
+            required:
+            - eni
+            type: object
+          status:
+            description: PodENIStatus defines the observed state of PodENI
+            properties:
+              ecsId:
+                type: string
+              nodeName:
+                type: string
+              phase:
+                description: |-
+                  INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
+                  Important: Run "make" to regenerate code after modifying this file
+                type: string
+              workLoad:
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lira-controller
+  namespace: kube-system
+  labels:
+    control-plane: lira-controller
+spec:
+  selector:
+    matchLabels:
+      control-plane: lira-controller
+  replicas: 1
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: lira-controller
+      labels:
+        control-plane: lira-controller
+    spec:
+      hostNetwork: true
+      containers:
+      - command:
+        - /lira-controller
+        args:
+        - --leader-elect
+        - --open-api-url=http://gc-vpc-portal.msxfcloud.svc:8080
+        image: lira-controller:latest
+        name: lira-controller
+        imagePullPolicy: Always
+        securityContext:
+          allowPrivilegeEscalation: false
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 9081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 9081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          limits:
+            cpu: 500m
+            memory: 128Mi
+          requests:
+            cpu: 10m
+            memory: 64Mi
+      serviceAccountName: lira-sa
+      terminationGracePeriodSeconds: 10
+      nodeSelector:
+        node-role.kubernetes.io/control-plane:
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: lira-daemon
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: lira-daemon
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 10%
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: lira-daemon
+    spec:
+      priorityClassName: system-node-critical
+      hostNetwork: true
+      tolerations:
+        - operator: "Exists"
+      serviceAccountName: lira-sa
+      initContainers:
+        - name: install-cni
+          image: harborxy.msxfcloud.test/base/lira-cni:latest
+          imagePullPolicy: Always
+          securityContext:
+            runAsUser: 0
+            privileged: true
+          command:
+            - /install-cni.sh
+          volumeMounts:
+            - name: host-usr
+              mountPath: /usr
+            - name: cni-bin
+              mountPath: /opt/cni/bin
+            - name: cni-etc
+              mountPath: /etc/cni/net.d/
+      containers:
+        - name: lira-daemon
+          image: harborxy.msxfcloud.test/base/lira-daemon:latest
+          imagePullPolicy: Always
+          command:
+            - "/lira-daemon"
+          securityContext:
+            runAsUser: 0
+            capabilities:
+              add:
+                - NET_ADMIN
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 100m
+              memory: 100Mi
+            limits:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: var-run
+              mountPath: /var/run
+      volumes:
+        - name: host-usr
+          hostPath:
+            path: /usr
+            type: "Directory"
+        - name: var-run
+          hostPath:
+            path: /var/run/
+            type: "Directory"
+        - name: cni-bin
+          hostPath:
+            path: /opt/cni/bin
+            type: "Directory"
+        - name: cni-etc
+          hostPath:
+            path: /etc/cni/net.d
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lira-sa
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lira-role
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+      - pods/exec
+      - namespaces
+      - nodes
+      - configmaps
+    verbs:
+      - create
+      - get
+      - list
+      - watch
+      - patch
+      - update
+  - apiGroups:
+    - network.msxf.com
+    resources:
+    - podenis
+    verbs:
+    - create
+    - delete
+    - get
+    - list
+    - patch
+    - update
+    - watch
+  - apiGroups:
+    - network.msxf.com
+    resources:
+    - podenis/finalizers
+    verbs:
+    - update
+  - apiGroups:
+    - network.msxf.com
+    resources:
+    - podenis/status
+    verbs:
+    - get
+    - patch
+    - update
+  - apiGroups:
+      - ""
+      - networking.k8s.io
+      - apps
+      - extensions
+    resources:
+      - networkpolicies
+      - services
+      - services/status
+      - endpoints
+      - statefulsets
+      - daemonsets
+      - deployments
+      - deployments/scale
+    verbs:
+      - create
+      - delete
+      - update
+      - patch
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - ""
+    resources:
+      - events
+    verbs:
+      - create
+      - patch
+      - update
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - "*"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: lira-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: lira-role
+subjects:
+- kind: ServiceAccount
+  name: lira-sa
+  namespace: kube-system
