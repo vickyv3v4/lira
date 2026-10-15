@@ -32,7 +32,7 @@
 ## 2. 备选方案对比
 
 | 备选 | 结论 | 理由 |
-|---|---|---|
+| --- | --- | --- |
 | kube-proxy iptables 调优 | 否 | 线性遍历与全量刷规则的本质不变，只能推迟问题 |
 | kube-proxy IPVS 模式 | 否 | 解决规则规模，但仍是 netfilter 全路径 + nf_conntrack；无法与网络策略共享连接状态；源保持（二期）无从谈起 |
 | 引入 Cilium 整体替换 | 否 | Cilium 要接管 CNI 数据面，与 lira 的 ENI 直通/ipvlan 架构冲突；引入第二套网络体系，运维成本大于收益。只取其模型（map 结构、ct 设计），不引其栈 |
@@ -44,26 +44,28 @@
 
 1. 容器侧结构相同（eth0 + veth1，ServiceCIDR 均指 veth1）；
 2. ClusterIP 不是 VPC 可路由地址，svc 流量在两种模式下都必然经宿主机中转；
-3. 因此请求入口（lirayyyy）、本地后端投递（liraxxxx）、回包还原（eth0）是同一批设备。
+3. 因此请求入口（pod 宿主 veth）、本地后端投递（liraxxxx）、回包还原（eth0）是同一批设备。
 
 **唯一差异：远端后端回包回到本节点后的落点。** 共享模式 ENI 在宿主机 netns（回包可经 ENI 主口）；独占模式 ENI 在 pod netns（回包直达 pod 内）。一期全 SNAT 语义下回包统一从 eth0 回，该差异不生效；二期源保持时才分叉（§5.3）。
 
 ### 3.2 挂载点
 
-| 程序 | 位置 | 职责 |
-|---|---|---|
-| S1 | lirayyyy tc-ingress（每 pod 宿主 veth） | svc 请求入口：ct 查已有连接 → 查 svc4 → 选后端 → DNAT+SNAT → 本地后端 `bpf_redirect(liraxxxx)`；远端交宿主机路由 |
-| S2 | eth0 tc-ingress | ① ct 反查命中 → 回包还原 → redirect(lirayyyy)；② ct 未命中 → NodePort/ExternalIP 新连接入口 |
-| S3 | eth0 tc-egress（另挂 lo） | host 起源的 svc 请求 DNAT；ct 标记的包直接放行（防回环） |
-| H2 集成（共享模式二期） | ENI 主口 tc-ingress | 源保持场景下远端回包还原 |
-| P3（独占模式二期） | pod 内 ENI tc-ingress | 源保持场景下回包还原（需 reconcile，同 H4 处理方式） |
+三个程序按职责命名：
 
-一期 S1/S2/S3 全部在宿主机 netns，pod 无法触碰（安全边界，§9）。
+| 程序 | 位置 | 职责 |
+| --- | --- | --- |
+| svc请求入口 | pod 宿主 veth（lirayyyy）tc-ingress | ct 查已有连接 → 查 svc4 → 选后端 → DNAT+SNAT → 本地后端 `bpf_redirect(liraxxxx)`；远端交宿主机路由 |
+| 回包还原入口 | eth0（节点主网卡）tc-ingress | ① ct 反查命中 → 回包还原 → redirect(lirayyyy)；② ct 未命中 → NodePort/ExternalIP 新连接入口 |
+| host起源入口 | eth0 tc-egress（另挂 lo） | host 起源的 svc 请求 DNAT；ct 标记的包直接放行（防回环） |
+
+（二期新增：共享模式在 ENI 主口入向程序里集成源保持还原；独占模式在 pod 内 ENI 挂还原程序，需 reconcile。）
+
+一期三个程序全部在宿主机 netns，pod 无法触碰（安全边界，§10）。
 
 ## 4. 数据结构
 
 | Map | 类型 | Key → Value | 说明 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | svc4 | hash | (IP, port, proto) → svc_id + 算法 | ClusterIP 用实际 IP；NodePort 用 0.0.0.0（与 kube-proxy 任意本机地址可访的语义一致） |
 | backends | hash | (svc_id, 序号) → 后端 IP:port + rev_nat_id | Endpoint 变更只重写该 svc 的槽位 |
 | rev_nat | hash | (rev_nat_id, 后端五元组) → 前端五元组 | 反向还原依据 |
@@ -71,7 +73,7 @@
 | snat | LRU hash | (出口IP, 协议, 端口) → 原始元组 | BPF 内做 SNAT 必须自管端口池：分配即在 snat/ct 记账，LRU 回收空闲端口 |
 | affinity | LRU hash（可选） | ClientIP → 后端 | sessionAffinity=ClientIP |
 
-**ct 语义（关键设计）**：S1 对每个新连接先按"原始五元组+方向"查 ct；命中则直接套用记录的 NAT 结果（后端不变）；未命中才查 svc4 选后端并写 ct。TCP 中断连接靠 ct 的方向位区分请求/回程，回程命中时执行反向还原。
+**ct 语义（关键设计）**：svc请求入口对每个新连接先按"原始五元组+方向"查 ct；命中则直接套用记录的 NAT 结果（后端不变）；未命中才查 svc4 选后端并写 ct。TCP 中断连接靠 ct 的方向位区分请求/回程，回程命中时执行反向还原。
 
 ## 5. 主干流程
 
@@ -89,28 +91,28 @@ svc agent 放在 **lira-daemon**（每节点一个），watch Service / Endpoint
 **① pod → svc，后端本节点（闭环）**
 
 ```
-请求: pod1(ClusterIP) → veth1 → S1: ct未命中 → svc4命中 → 选pod2
+请求: pod1(ClusterIP) → veth1 → svc请求入口: ct未命中 → svc4命中 → 选pod2
       → DNAT dst→10.0.8.67, SNAT src→节点IP(端口从snat池分配)
       → 写ct/snat → bpf_redirect(liraxxxx) → pod2经veth1收到
 回程: pod2(dst=节点IP) → 经其业务口 → VPC → 本节点eth0
-      → S2: ct反查命中 → src还原ClusterIP、dst还原pod1 → redirect(lirayyyy) → pod1
+      → 回包还原入口: ct反查命中 → src还原ClusterIP、dst还原pod1 → redirect(lirayyyy) → pod1
 ```
 
-**② pod → svc，后端远端节点**：S1 同样 DNAT+SNAT 后返回 TC_ACT_OK，交宿主机路由出 eth0；回包必然回到本节点 eth0（源是本节点 IP），S2 统一还原。链路与①对称，闭环。
+**② pod → svc，后端远端节点**：svc请求入口同样 DNAT+SNAT 后返回 TC_ACT_OK，交宿主机路由出 eth0；回包必然回到本节点 eth0（源是本节点 IP），回包还原入口统一还原。链路与①对称，闭环。
 
-**③ NodePort / ExternalIP 入向**：外部包到 eth0 → S2 先查 ct（回包场景）→ 未命中查 svc4（NodePort）→ DNAT+SNAT → 本地 redirect / 远端交路由；回包经 S2 还原后 `bpf_redirect(eth0)` 出站。
+**③ NodePort / ExternalIP 入向**：外部包到 eth0 → 回包还原入口先查 ct（回包场景）→ 未命中查 svc4（NodePort）→ DNAT+SNAT → 本地 redirect / 远端交路由；回包经还原后 `bpf_redirect(eth0)` 出站。
 
-**④ host → svc**：S3（eth0-egress / lo）拦截本机发出的 ClusterIP 流量 → DNAT+SNAT → 本地 redirect；回包仍走 S2。
+**④ host → svc**：host起源入口（eth0-egress / lo）拦截本机发出的 ClusterIP 流量 → DNAT → 本地 redirect；回包仍走回包还原入口。
 
-**⑤ hairpin（pod 访问自身所在的 svc 且选中自己）**：S1 DNAT 后发现后端=本 pod → 照常 redirect(liraxxxx) 回到自己，回程走②同款路径（回包经 VPC 回 eth0 还原）。可用性闭环，代价是回包一次 VPC hairpin，与 kube-proxy 现状一致。
+**⑤ hairpin（pod 访问自身所在的 svc 且选中自己）**：DNAT 后发现后端=本 pod → 照常 redirect(liraxxxx) 回到自己，回程走②同款路径（回包经 VPC 回 eth0 还原）。可用性闭环，代价是回包一次 VPC hairpin，与 kube-proxy 现状一致。
 
 **⑥ 异常路径闭环**：
 
 | 场景 | 行为 |
-|---|---|
-| S2 反查 ct 未命中（ct 被淘汰/节点重启） | 包继续进协议栈，目的=节点IP 无监听 → RST，客户端重试新建连接。与 kube-proxy 丢 conntrack 的行为一致 |
+| --- | --- |
+| 回包还原入口 ct 未命中（ct 被淘汰/节点重启） | 包继续进协议栈，目的=节点IP 无监听 → RST，客户端重试新建连接。与 kube-proxy 丢 conntrack 的行为一致 |
 | svc4 未命中（非 svc 流量/未就绪 Service） | TC_ACT_OK 原样放行，交协议栈（无 svc 处理时一切如常） |
-| backends 空（Service 无后端） | S1 返回丢弃（等价 kube-proxy 的拒绝），或按 配置 返回 TC_ACT_OK 交协议栈得到 refused——一期取后者，语义与现状对齐 |
+| backends 空（Service 无后端） | 一期取 TC_ACT_OK 交协议栈得到 refused——语义与现状对齐 |
 | externalTrafficPolicy=Local 且本节点无后端 | 丢弃（K8s 语义规定，与 kube-proxy 一致） |
 | UDP（DNS） | ct 按 UDP 超时（秒级）回收；LRU 本身面向高 churn 设计 |
 
@@ -119,15 +121,15 @@ svc agent 放在 **lira-daemon**（每节点一个），watch Service / Endpoint
 一期 SNAT 去掉后，pod 源 IP 可直达后端（VPC 可路由）：
 
 | | 共享 ENI | 独占 ENI |
-|---|---|---|
-| 本地后端回包 | pod2 → VPC → 本节点 ENI 主口 → **H2 内 ct 反查还原**（无新程序） | pod2 → VPC → pod1 netns 内的 ENI → **P3 还原**（pod 内挂程序） |
+| --- | --- | --- |
+| 本地后端回包 | pod2 → VPC → 本节点 ENI 主口 → **主口入向程序内 ct 反查还原**（无新程序） | pod2 → VPC → pod1 netns 内的 ENI → **pod 内 ENI 还原程序**（pod 内挂程序） |
 | 收益 | 后端看到真实源，网络策略按真实身份判定；少一次 VPC hairpin | 同左 |
-| 代价 | 无 | pod 内程序可被特权容器摘除 → daemon reconcile 重挂（与网络策略 H4 同一机制） |
+| 代价 | 无新增 pod 内程序 | 新增 pod 内程序（特权 pod 可摘，需 reconcile，与网络策略方案的 pod 内程序同一机制） |
 
 ## 6. 生命周期与状态一致性
 
 | 事件 | 处理 | 闭环依据 |
-|---|---|---|
+| --- | --- | --- |
 | Service 创建 | 写 backends/rev_nat → 写 svc4 | 数据面可见即一致 |
 | Endpoint 扩缩 | 重写该 svc 槽位；缩容联动清 ct | 存量连接不黑洞 |
 | Service 删除 | 摘 svc4 → 清 backends/rev_nat | 先停新连接再清状态 |
@@ -138,7 +140,7 @@ svc agent 放在 **lira-daemon**（每节点一个），watch Service / Endpoint
 ## 7. 容量规划
 
 | Map | 规划依据 |
-|---|---|
+| --- | --- |
 | svc4 / backends / rev_nat | 集群 Service 数与平均后端数（如 5k svc × 10 后端量级，内存 MB 级）；写满时 agent 报警并拒绝新 Service，**存量不缩**（只增不减的失败模式） |
 | ct | 并发连接速率 × 超时时长；LRU 满后淘汰冷连接 |
 | snat | 出口 IP 端口空间（65535-1024）/ 端口占用时长；按 NodePort 并发与跨节点 svc 流量规划 |
@@ -146,10 +148,10 @@ svc agent 放在 **lira-daemon**（每节点一个），watch Service / Endpoint
 ## 8. 故障模式分析
 
 | 故障 | 影响面 | 恢复 |
-|---|---|---|
+| --- | --- | --- |
 | agent（daemon 内）崩溃 | 数据面继续工作（map 是持久状态）；仅 Service 变更停止生效 | daemon 重启自愈；节点 svc 变更期间告警 |
 | 程序 attach 失败（内核差异） | daemon 启动时失败即不上报就绪 | 该节点维持 kube-proxy，灰度自然跳过 |
-| eBPF 程序逻辑 bug | 限定在所在节点 | 节点级回滚开关（§8 灰度）；ringbuf 丢弃计数告警 |
+| eBPF 程序逻辑 bug | 限定在所在节点 | 节点级回滚开关（§9 灰度）；ringbuf 丢弃计数告警 |
 | map 写满 | 新 Service/新连接失败 | 告警 + 容量规划；LRU 类自回收 |
 | 节点宕机 | 其上连接中断（与 kube-proxy 一致，conntrack 同样丢失） | 客户端重试 |
 | 配置漂移（map 与 k8s 不一致） | 策略与实际后端不符 | resync 周期全量比对 |
@@ -168,9 +170,9 @@ svc agent 放在 **lira-daemon**（每节点一个），watch Service / Endpoint
 
 ## 10. 安全边界
 
-- S1/S2/S3 与全部 map 在宿主机 netns，pod 无 CAP 权限不可触碰；加载需要节点 CAP_BPF/CAP_SYS_ADMIN，与 kube-proxy 写 iptables 的权限等级一致；
+- 三个程序与全部 map 在宿主机 netns，pod 无 CAP 权限不可触碰；加载需要节点 CAP_BPF/CAP_SYS_ADMIN，与 kube-proxy 写 iptables 的权限等级一致；
 - 一期 SNAT 后源身份丢失由网络策略方案的 slave 侧防伪造独立兜底（两方案互不依赖对方的正确性）；
-- 二期 P3 在 pod netns，复用网络策略方案的 reconcile 机制与风险结论。
+- 二期 pod 内 ENI 还原程序在 pod netns，复用网络策略方案的 reconcile 机制与风险结论。
 
 ## 11. 性能验证方案
 
@@ -183,12 +185,12 @@ svc agent 放在 **lira-daemon**（每节点一个），watch Service / Endpoint
 ## 12. 已知限制
 
 | 限制 | 原因 | 对策/接受理由 |
-|---|---|---|
+| --- | --- | --- |
 | 一期保留 SNAT | 行为对齐优先，灰度与回滚要求 diff 可测 | 二期源保持已设计（§5.3） |
-| NodePort 仅覆盖 eth0 与 lo | 共享模式如需 ENI 主 IP 暴露 NodePort，在 H2 加查表即可；独占模式 ENI 在 pod netns，与 kube-proxy 现状一致 | 与现状对齐 |
+| NodePort 仅覆盖 eth0 与 lo | 共享模式如需 ENI 主 IP 暴露 NodePort，在主口入向程序加查表即可；独占模式 ENI 在 pod netns，与 kube-proxy 现状一致 | 与现状对齐 |
 | hostNetwork 后端 | DNAT 后走本机协议栈 | ct 还原闭环，语义与 kube-proxy 一致 |
 | TCP 连接被 LRU 淘汰会断连 | 状态表有限容量 | 容量规划 + 满载告警 + BPF LRU 冷热倾向 |
-| localhost 访问 ClusterIP | 需挂 lo（S3） | 已纳入挂载清单 |
+| localhost 访问 ClusterIP | 需挂 lo（host起源入口） | 已纳入挂载清单 |
 
 ## 13. 评审关注点自答
 
@@ -220,12 +222,12 @@ UDP ct 超时秒级、LRU 面向高 churn 设计；容量按 QPS × 超时规划
 无 ClusterIP，DNS 直接返回后端 IP，流量走 pod 直连路径，不进入本数据面。闭环。
 
 **Q10：与网络策略方案什么关系？**
-共用 pin 目录、ct map、agent 骨架；部署相互独立。共享模式二期源保持后，svc 流量在 H3 的策略判定自动获得真实源，策略方案无需改动。
+共用 pin 目录、ct map、agent 骨架；部署相互独立。共享模式二期源保持后，svc 流量在网络策略方案的 veth出向检查点自动获得真实源判定，策略方案无需改动。
 
 ## 14. 分期与验收标准
 
 | 阶段 | 内容 | 验收标准 |
-|---|---|---|
-| 一期 | S1/S2/S3 + SNAT 语义对齐 kube-proxy，逐节点灰度 | §9-4 验证清单全通过；单节点长期运行（含 Endpoint churn）无漂移 |
-| 二期 | 源保持（共享 H2 集成 / 独占 P3），与网络策略真实源判定打通 | 后端可见真实源；策略对 svc 流量按 pod 身份生效 |
+| --- | --- | --- |
+| 一期 | 三个程序 + SNAT 语义对齐 kube-proxy，逐节点灰度 | §9-4 验证清单全通过；单节点长期运行（含 Endpoint churn）无漂移 |
+| 二期 | 源保持（共享模式主口入向集成 / 独占模式 pod 内程序），与网络策略真实源判定打通 | 后端可见真实源；策略对 svc 流量按 pod 身份生效 |
 | 三期 | maglev、per-svc metrics、healthCheckNodePort 由 agent 提供 | LB 一致性测试；指标可视 |

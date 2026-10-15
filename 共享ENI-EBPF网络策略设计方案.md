@@ -24,7 +24,7 @@ eBPF 是内核提供的一种机制：允许把一段受限的 C 程序编译后
 本方案用到三个组成部分：
 
 | 组成 | 是什么 | 在本方案中的角色 |
-|---|---|---|
+| --- | --- | --- |
 | 程序 | 挂在内核事件点上的处理函数，输入是一个数据包（skb），返回放行或丢弃 | 挂在各网卡口上做策略判定 |
 | map | 内核里的键值表，内核态程序和用户态进程都能读写 | 存放身份表、策略表、连接表 |
 | verifier/JIT | 加载时的安全校验和编译 | 保证程序安全，无需信任程序作者 |
@@ -58,7 +58,7 @@ map 是内核维护的键值表，两个特性决定了它适合做策略：
 ### 2.4 为什么不用 iptables
 
 | | iptables | eBPF |
-|---|---|---|
+| --- | --- | --- |
 | 能否看到共享 ENI 的流量 | 看不到。ipvlan 的包绕过宿主机协议栈直接从主口进出，不经过任何 netfilter 链 | tc 挂在网卡上，包从网卡进出一律经过 |
 | 匹配开销 | 线性遍历规则，O(规则数) | map 哈希查找，O(1) |
 | 有状态 | 依赖 conntrack，规则静态 | 连接表自己建在 map 里，可编程 |
@@ -74,43 +74,43 @@ ipvlan 所有子口共用 ENI 的 MAC，身份只能用 IP 表达：
 
 ## 4. 执行点布局
 
-程序由 lira-daemon 统一挂载，一套编译产物 attach 到多个位置：
+程序由 lira-daemon 统一挂载，一套编译产物 attach 到四个位置。四个执行点按"设备+方向"命名：
 
 ```
                  VPC云网络
                     │
         ┌───────────┴────────────┐
-        │ [H2] ENI主口 tc-ingress │←──── 外部/跨节点入向（ipvlan分发之前）
-        │ [H1] ENI主口 tc-egress  │───── pod出向、同节点不同ENI互访
+        │ [主口入向] ENI tc-ingress │←──── 外部/跨节点入向（ipvlan分发之前）
+        │ [主口出向] ENI tc-egress  │───── pod出向、同节点不同ENI互访
         │        eth1(ENI)        │
         │   ┌──────┴───────┐      │
         │ liraxxxx      lirayyyy │
-        │ [H3] tc-egress          │←──── 宿主机→pod、svc DNAT后的流量
+        │ [veth出向] tc-egress     │←──── 宿主机→pod、svc DNAT后的流量
         │   │             │       │
         │ veth1          veth1    │
         │ eth0(ipvlan)   eth0     │
-        │ [H4] tc-egress/ingress  │←──── 同ENI pod互访直投 + 源IP校验
+        │ [pod口] tc-egress/ingress│←──── 同ENI pod互访直投 + 源IP校验
         │  Pod2          Pod1     │
         └─────────────────────────┘
 ```
 
 | 挂载点 | netns | 拦到的流量 | 为什么必须在这 |
-|---|---|---|---|
-| H1 ENI主口 tc-egress | 宿主机 | 全部 pod 出向 | slave 出向都从主口发出（内核已验证） |
-| H2 ENI主口 tc-ingress | 宿主机 | 全部入向（分发前） | tc ingress 在 ipvlan rx_handler 之前（内核已验证） |
-| H3 liraxxxx tc-egress | 宿主机 | 宿主机路由到 pod 的流量 | host 访问 pod、svc 后端为本节点 pod，走的是 veth 不是 ipvlan |
-| H4 pod内ipvlan口 tc | pod | 同 ENI 直投流量 + 本 pod 全部出向 | 同 ENI 互访内核直投，主口两个钩子都看不到，这是唯一落点 |
+| --- | --- | --- | --- |
+| 主口出向（ENI tc-egress） | 宿主机 | 全部 pod 出向 | slave 出向都从主口发出（内核已验证） |
+| 主口入向（ENI tc-ingress） | 宿主机 | 全部入向（分发前） | tc ingress 在 ipvlan rx_handler 之前（内核已验证） |
+| veth出向（liraxxxx tc-egress） | 宿主机 | 宿主机路由到 pod 的流量 | host 访问 pod、svc 后端为本节点 pod，走的是 veth 不是 ipvlan |
+| pod口（pod内ipvlan口 tc 双向） | pod | 同 ENI 直投流量 + 本 pod 全部出向 | 同 ENI 互访内核直投，主口两个钩子都看不到，这是唯一落点 |
 
 **六条数据链路 → 执行点对照：**
 
 | 数据链路 | 源方向检查 | 目的方向检查 |
-|---|---|---|
-| 节点访问同节点pod | 节点=固定身份，按集群配置 | H3 |
-| 同节点不同ENI互访 | H1 | H2 |
-| 同节点相同ENI互访 | H4（源pod ipvlan egress） | H4（目的pod ipvlan ingress） |
-| 跨节点pod访问 | H1 | H2 |
-| 访问SVC后端同节点 | H3（DNAT后：src=真实源pod，dst=后端IP，一次同时查源的egress与后端的ingress策略） | 同左 |
-| 访问集群外ECS | H1（CIDR 规则） | — |
+| --- | --- | --- |
+| 节点访问同节点pod | 节点=固定身份，按集群配置 | veth出向 |
+| 同节点不同ENI互访 | 主口出向 | 主口入向 |
+| 同节点相同ENI互访 | pod口出向（源pod） | pod口入向（目的pod） |
+| 跨节点pod访问 | 主口出向（源节点ENI） | 主口入向（目的节点ENI） |
+| 访问SVC后端同节点 | veth出向（DNAT后：src=真实源pod，dst=后端IP，一次同时查源的egress与后端的ingress策略） | 同左 |
+| 访问集群外ECS | 主口出向（CIDR 规则） | — |
 
 ## 5. 主干流程
 
@@ -123,10 +123,10 @@ pod调度 → PodENI创建 → lira-controller分配secondary ip → PodENI进�
 lira CNI发起gRPC → lira-daemon AllocIP返回（此时拿到PodIP/接口名）
    │
    ├─ 创建容器内ipvlan口 + veth口
-   ├─ attach H4程序到ipvlan口（pin目录里的程序，attach到新口）
+   ├─ attach pod口程序到ipvlan口（pin目录里的程序，attach到新口）
    ├─ 写pod_ip map：PodIP → 身份ID（身份ID由agent按labels预分配）
    ├─ 写slave_src map：ipvlan口ifindex → 本pod的IP
-   └─ 宿主机veth口attach H3程序
+   └─ 宿主机veth口attach veth出向程序
 ```
 
 ### 5.2 策略下发流程（控制面）
@@ -152,21 +152,21 @@ policy agent（lira-controller内）：
 **链路一：跨节点 pod1 → pod2**
 
 ```
-1. pod1 发包，出slave口 → H4: 校验源IP=本pod IP（防伪造），放行
-2. 到ENI主口 → H1: 查pod_ip[src]得身份A，查pod_ip[dst]得身份B
+1. pod1 发包，出slave口 → pod口出向: 校验源IP=本pod IP（防伪造），放行
+2. 到ENI主口 → 主口出向: 查pod_ip[src]得身份A，查pod_ip[dst]得身份B
    ct命中（已建立连接）→ 放行
    否则查policy(A→B,协议,端口) → 通过则写ct、放行；不通过 TC_ACT_SHOT 丢弃
 3. VPC转发到对端节点
-4. 对端ENI主口 → H2: 查dst身份，查ct/ingress policy → 放行
+4. 对端ENI主口 → 主口入向: 查dst身份，查ct/ingress policy → 放行
 5. ipvlan分发进pod2的slave口 → pod2收到
 ```
 
 **链路二：同ENI pod1 → pod2（内核直投，不过主口）**
 
 ```
-1. pod1发包 → H4(源slave egress): 源IP校验 + 查policy(A→B) —— 唯一执行点
+1. pod1发包 → pod口出向(源slave): 源IP校验 + 查policy(A→B) —— 唯一执行点
 2. 内核直投到pod2的slave口
-3. H4(目的slave ingress): 校验dst=本pod IP + 查ingress policy
+3. pod口入向(目的slave): 校验dst=本pod IP + 查ingress policy
 4. pod2收到
 ```
 
@@ -175,7 +175,7 @@ policy agent（lira-controller内）：
 ```
 1. pod1把目的写为ClusterIP，经veth1进宿主机（走veth，不走ipvlan）
 2. kube-proxy做DNAT: dst改为pod2的IP（源不变，仍是pod1真实IP）
-3. 宿主机路由: 10.0.8.67 dev liraxxxx → 出liraxxxx → H3:
+3. 宿主机路由: 10.0.8.67 dev liraxxxx → 出liraxxxx → veth出向:
    src=pod1真实IP、dst=pod2 → 查源身份A的egress策略 + 查pod2身份B的ingress策略
 4. pod2经veth1收到；回程由ct放行并还原源为ClusterIP
 ```
@@ -186,12 +186,12 @@ NetworkPolicy 语义是有状态的（允许出去自动放回包）：首个包
 
 ### 5.5 回收流程（pod 删除）
 
-ReleaseIP → 清 pod_ip / slave_src / policy 中该身份的条目 → detach 并清 H4 → ct 条目随 LRU 自然过期。程序和 map 都 pin 在 /sys/fs/bpf/lira/ 下，daemon 重启不影响已挂载的程序。
+ReleaseIP → 清 pod_ip / slave_src / policy 中该身份的条目 → detach 并清 pod 内程序 → ct 条目随 LRU 自然过期。程序和 map 都 pin 在 /sys/fs/bpf/lira/ 下，daemon 重启不影响已挂载的程序。
 
 ## 6. BPF Map 设计
 
 | Map | 类型 | 内容 | 写入方 |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | pod_ip | hash | PodIP → 身份ID | daemon（建链）/ agent |
 | policy | hash + lpm子表 | (源身份，目的身份，协议，端口) → 动作；CIDR对端走lpm | agent |
 | ct | LRU hash | 五元组+方向 → 状态/超时 | 数据面运行时 |
@@ -200,14 +200,14 @@ ReleaseIP → 清 pod_ip / slave_src / policy 中该身份的条目 → detach �
 
 ## 7. 安全边界
 
-- **防伪造双层**：H4 校验源 IP = 本 pod 分配的 IP（防同 ENI pod 之间冒用）；H1 校验源属于本节点已分配 IP（防未分配 IP 出网）。共享 ENI 下 MAC 全同、VPC 无法区分，这两层是安全前提。
-- **抗篡改分层**：H1–H3 在宿主机 netns，pod 不可触碰；H4 在 pod netns，特权容器理论上可摘除 → daemon 周期性 reconcile（对照 pin 目录重挂）。
+- **防伪造双层**：pod内ipvlan口校验源 IP = 本 pod 分配的 IP（防同 ENI pod 之间冒用）；主口出向校验源属于本节点已分配 IP（防未分配 IP 出网）。共享 ENI 下 MAC 全同、VPC 无法区分，这两层是安全前提。
+- **抗篡改分层**：主口出向/主口入向/veth出向三个程序在宿主机 netns，pod 不可触碰；pod口程序在 pod netns，特权容器理论上可摘除 → daemon 周期性 reconcile（对照 pin 目录重挂）。
 - **内核版本要求**：按设施逐项核对——clsact 4.5 / LRU map 4.10 / lpm trie 4.11 / ringbuf 5.8 / BTF 5.2。实施前先在节点上 `uname -r` 确认；3.10 内核无 clsact，方案不成立；4.11–5.7 可行但 ringbuf 需换 perf event array、lpm 需换 hash 分桶；5.8+ 全功能。
 
 ## 8. 已知限制
 
 | 问题 | 说明与对策 |
-|---|---|
+| --- | --- |
 | 跨节点SVC源身份退化 | kube-proxy 对跨节点流量做 SNAT，后端看到的源是节点IP，策略只能按节点身份放行。一期接受；后续可将服务NAT移入eBPF（参照Cilium），身份全程保留 |
 | hostNetwork后端 | DNAT后目的为节点IP，流量走宿主机协议栈，无挂载点。按"节点身份"处理 |
 | 入向无法整形 | 策略只能丢弃不能排队（所有入向策略的通性） |
@@ -218,10 +218,10 @@ ReleaseIP → 清 pod_ip / slave_src / policy 中该身份的条目 → detach �
 两种模式流量路径不同，策略执行层是两套：
 
 | | 独占 ENI（安全组） | 共享 ENI（本方案） |
-|---|---|---|
+| --- | --- | --- |
 | 执行位置 | VPC 云层面 | 节点上 |
 | 现状 | 每张ENI创建时挂安全组（podeni_controller） | 需本方案新增 |
-| 抗篡改 | 强：包到网卡才过安全组 | 分层：H1–H3不可篡改，H4靠reconcile |
+| 抗篡改 | 强：包到网卡才过安全组 | 分层：宿主机侧三个程序不可篡改，pod内程序靠reconcile |
 | 语义 | 只有allow白名单，表达不了deny | NetworkPolicy完整语义 |
 | 生效速度 | 走VPC API，秒级到十秒级 | map更新，毫秒级 |
 | VPC调用压力 | 每次策略变更打VPC接口 | 零 |
@@ -230,6 +230,6 @@ ReleaseIP → 清 pod_ip / slave_src / policy 中该身份的条目 → detach �
 
 ## 10. 分期实施
 
-1. **一期**：pod_ip / slave_src / policy(CIDR粒度) + H1/H2/H4挂载——管住南北向和防伪造
-2. **二期**：NetworkPolicy 完整语义（标签选择、协议端口）+ H3，补齐同ENI东西向和svc路径
+1. **一期**：pod_ip / slave_src / policy(CIDR粒度) + 主口出向/主口入向/pod口挂载——管住南北向和防伪造
+2. **二期**：NetworkPolicy 完整语义（标签选择、协议端口）+ veth出向程序，补齐同ENI东西向和svc路径
 3. **三期**：ct 有状态补全、策略命中 metrics、跨节点SVC真实源还原
