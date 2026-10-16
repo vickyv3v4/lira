@@ -27,6 +27,7 @@
 | 超分 | **CPU 节点放大**：MutatingWebhook 改 Allocatable × 超分比 + OverSaleJob 打真实利用率注解 + Score 插件过载保护（pool 级 setRate） | GPU 显存超分/切分 | **方法论继承**：pool 级超分率 + 设备级切分 + 监控对账；差异点见 §3 链路 4 |
 | 多集群 | 元集群按 poolCode 划分，res 两级 client 工厂，kubeconfig 收敛在 res | GPU 资源池纳管 | 完全复用，零改动 |
 | 租户凭证 | res `CreateKubeConfig` 签发受限 kubeconfig（Secret 下发） | 租户提交训练作业 | **直接复用**，租户凭它向工作集群提交 vcjob |
+| 存储 | 平台已有 CSI（egp-csi-nas / nfs，超分 PDF node describe 可证）；MCK volume 随节点交付（**存算耦合**） | 数据集/模型/checkpoint 共享存储 + 缓存加速 | **新增数据层**（Fluid/JuiceFS 独立缓存集群），见 §3.5 |
 
 > **面试点**：先亮这张表再讲链路。面试官立刻明白：你不是"学了个 HAMi 硬凑方案"，而是"拿着自家平台的资产清单找 GPU 的最佳拼装位"。**架构师岗位考的就是这个映射能力**。
 
@@ -52,14 +53,18 @@
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 节点层  GPU ECS ← 订单 → DNAT → kubespray(新增 gpu playbook) → 打标           │
 │         MCK 元集群按 poolCode 纳管, CR namespace = mck-<tenantId> (零改动)     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 数据层  L0 对象存储(S3)/NFS ← L1 独立CPU缓存集群(Fluid/JuiceFS, 不与GPU混部)   │
+│         L2 Dataset CR + PVC(RWX 共享读) · 缓存亲和调度                         │
+│         (存算分离: GPU 节点无状态化, 数据不随节点走)                           │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**层与层之间的接口全是 MCK/K8s 原生对象**：portal↔res 是 HTTP，res↔元集群是 CR/CM，节点层↔设备层是 device plugin API，调度层↔设备层是 extended resource + scheduler plugin，业务层↔经营层是 Kafka 事件 + 监控指标。**没有发明任何一个新协议。**
+**层与层之间的接口全是 MCK/K8s 原生对象**：portal↔res 是 HTTP，res↔元集群是 CR/CM，节点层↔设备层是 device plugin API，调度层↔设备层是 extended resource + scheduler plugin，作业↔数据层是 PVC/Dataset CR，业务层↔经营层是 Kafka 事件 + 监控指标。**没有发明任何一个新协议。**
 
 ---
 
-## 3. 四条闭环链路（主菜）
+## 3. 五条闭环链路（主菜）
 
 > 闭环的定义（面试直接讲这个框架）：每条链路必须四要素齐备——**正向流、状态回流、失败分支、兜底对账**。MCK 的 CPU 链路正因为四要素齐了才算"生产可用"，智算链路逐条对照补齐。
 
@@ -174,6 +179,43 @@ GPU 侧逐项映射：
 
 > **面试金句**：「CPU 超分我们踩过的所有坑——监控取值要跟 SRE 对齐、webhook 性能要压测、超分率只能由大往小调、分阶段上线——在 GPU 侧全部前置成了设计约束。显存不可压缩，所以我一期直接把超分率钉死在 1.0，把"切分"和"超分"分成两个阶段。**方案的可信度来自方法论的继承，而不是参数的拍脑袋**。」
 
+### 3.5 链路 5：存算分离与数据集闭环（补存储层——同时填 JD"容器存储"空白）
+
+**为什么智算必须有这层（三个 IO 特征决定）**：模型文件大且共享读（7B FP16 ≈ 14GB、70B ≈ 140GB，几十个作业反复加载同一模型，不能每次冷读对象存储）；训练数据集 TB 级多作业共享读；checkpoint 写入带宽敏感（训练中断恢复的命脉）。
+
+**现状锚点（真实证据）**：平台现网已接 CSI——超分 PDF 的 node describe 里有 `csi.volume.kubernetes.io/nodeid: {"egp-csi-nas":...,"nfs.csi.k8s.io":...}`；而 MCK 的 volume 表是"卷随节点交付、生命周期依附节点"——**这是存算耦合形态，GPU 时代必须反转**。
+
+**"分离"的三层含义**：
+
+| 分离点 | 内容 | 带来的收益 |
+|---|---|---|
+| 节点分离 | 缓存集群是**独立 CPU 节点池**，不与 GPU 混部 | GPU 节点无状态化——缩容/故障替换不碰数据（呼应链路 1 缩容反向补偿：数据不在节点上，缩错不丢） |
+| 生命周期分离 | 数据集独立于集群/节点存在 | 集群删了数据集还在（MCK volume 表做不到的），跨集群复用同一份模型 |
+| 调度协同 | 缓存预热状态打 node label → 作业缓存亲和调度 | 避免冷读；Fluid × Volcano 是社区常用组合（集成机制 POC 核实，见未确认项 9） |
+
+**目标架构**：
+
+```
+L0 数据源层   对象存储(S3协议)/NFS —— 数据的唯一权威副本
+L1 缓存加速层 独立 CPU 缓存集群(JuiceFS/CubeFS/Fluid+缓存Runtime)
+              —— 用便宜机器扛吞吐, GPU 池只算不存
+L2 编排层     Fluid Dataset CR(数据集抽象+缓存可观测) + PV/PVC(RWX 只读共享)
+```
+
+**闭环四要素**：
+
+```
+正向流:   数据上传对象存储 → 注册 Dataset CR → 缓存预热(Runtime 扩容+warmup)
+          → 作业挂 PVC → 缓存亲和调度 → 运行
+状态回流: 缓存命中率/容量/IO 指标进云监控(与 DCGM 同源思路)
+失败分支: 预热失败不阻塞提交——降级直读 L0 + 告警; checkpoint 写失败=任务级告警
+兜底对账: Dataset 引用计数(无人引用的缓存自动回收) + 缓存集群容量水位
+```
+
+**分期**：二期只做 NFS/PV 共享读（RWX 基础版，零新组件）；三期上 Fluid 缓存集群 + 数据集产品化。**一期明确不做**——GPU 池规模小、作业形态未定，先不引入缓存复杂度。
+
+> **面试金句**：「MCK 现在的存储观是"卷跟着节点走"——这在 CPU 云成立，在 GPU 云必须反过来："**数据不动、算力流动**"。判断标准很朴素：缩容一台 GPU 机时，我不应该有一秒钟在担心数据。」
+
 ---
 
 ## 4. 关键设计决策（到接口/CR 粒度）
@@ -212,7 +254,7 @@ playbook 白名单（entrypoint.go 的 `ActionInfo` 表）新增：`gpu-driver.y
 | 路线 | 组成 | 优点 | 缺点 | 结论 |
 |---|---|---|---|---|
 | **A. Volcano + volcano-vgpu-device-plugin**（HAMi 官方文档路线） | Volcano 为集群唯一调度器（gang/queue/proportion），HAMi 只出 device-plugin + HAMi-core 隔离 | 单调度器无冲突；gang+队列+切分一次到位；官方文档明确支持（Volcano >1.9，`deviceshare.VGPUEnable: true`） | 放弃 HAMi 自身调度器的高级策略 | **主选** |
-| B. HAMi scheduler 为主 + Volcano 仅作 controller | schedulerName=hami-scheduler，用 vcjob/PodGroup 但调度走 HAMi | HAMi 策略丰富、异构卡管理强 | **双调度器冲突**：PodGroup 的 gang 语义没人保证；两套 scheduler 配置/版本漂移 | 仅当"纯推理、无 gang 需求"时可行 |
+| B. HAMi scheduler 为主 + Volcano 仅作 controller | schedulerName=hami-scheduler，用 vcjob/PodGroup 但调度走 HAMi | HAMi 策略丰富、异构卡管理强 | **双调度器冲突**：PodGroup 的 gang 语义没人保证（HAMi 2.10 已开始补 PodGroup/gang 支持，劣势在收敛，但仍非官方整合路线）；两套 scheduler 配置/版本漂移 | 仅当"纯推理、无 gang 需求"时可行 |
 | C. 双集群分治 | 训练集群=A 路线；推理集群=HAMi scheduler 独立集群 | 各取所长 | 多一套集群形态，MCK 多集群能力虽在但运维成本翻倍 | 演进选项，不是 MVP |
 
 > **面试点**：路线 A 的判定依据是 HAMi 官方文档原话——"You DON'T need to install HAMi when using volcano-vgpu"。**用上游自己的话收敛选型，比引用任何博客都硬**。同时补一句：HAMi 的价值在方案里没丢——HAMi-core（隔离）、volcano-vgpu-device-plugin（设备层）、以及未来国产卡接入（HAMi 支持 Ascend 910B/寒武纪/海光/燧原/摩尔线程，docs 目录可查）都是 HAMi 体系资产。
@@ -236,8 +278,8 @@ playbook 白名单（entrypoint.go 的 `ActionInfo` 表）新增：`gpu-driver.y
 | 期 | 目标 | 闭环内容 | 不做什么（明确说） |
 |---|---|---|---|
 | 一期 | GPU 集群交付 + 组件栈 | 链路 1 + 2：GPU 节点订单→装机→feature 安装→节点打标→计费 | 作业产品化、超分（memoryFraction=1.0） |
-| 二期 | 队列化调度 + 作业自闭环 | 链路 3：Queue/vcjob/gang/vgpu 切分 + 租户提交闭环（集群内） | 跨池调度 |
-| 三期 | 经营闭环 | 链路 4：对账器、水位、半自动扩缩容、计费口径落地 | 自动缩容（人工审批前置） |
+| 二期 | 队列化调度 + 作业自闭环 + 存储基础版 | 链路 3：Queue/vcjob/gang/vgpu 切分 + 租户提交闭环（集群内）；存储：NFS/PV 共享读（RWX） | 跨池调度、缓存加速层 |
+| 三期 | 经营闭环 + 存算分离完整版 | 链路 4：对账器、水位、计费口径落地；链路 5：Fluid 缓存集群 + 数据集产品化 | 自动缩容（人工审批前置） |
 | 演进 | 异构与联邦 | 国产卡（HAMi 异构 device support）、K8s DRA 方向、Karmada 多池联邦 | — |
 
 > **面试点**：分期的每条边界都是"砍需求"的决策——一期不做超分（不可压缩资源风险）、二期不做产品化（先验证调度）、三期不做自动缩容（误缩容不可逆）。**敢砍比敢做更显架构成熟度。**
@@ -297,32 +339,73 @@ playbook 白名单（entrypoint.go 的 `ActionInfo` 表）新增：`gpu-driver.y
 - **租户怎么提交任务？绕过平台怎么办？**
   租户只拿受限 kubeconfig（res 签发）；配额在 Queue 层而不是 RBAC 层，绕过提交最多占自己队列的份额；平台侧对账器保证 Queue capacity 真实。
 - **多机多卡训练的网络（RDMA/GPUDirect）考虑了吗？**
-  一期不做分布式高速互联（MCK 网络侧是共享 ENI VPC 直通，带宽满足推理/单机训练）；多机 NCCL 场景列入演进（需 RoCE/IB 网络，是独立网络方案，不在本方案画饼）。
+  一期不做分布式高速互联（MCK 网络侧是共享 ENI VPC 直通，带宽满足推理/单机训练）；多机 NCCL 场景列入演进（需 RoCE/IB 网络，是独立网络方案，不在本方案画饼）。拓扑感知调度上游已有独立可复用的解——**Volcano 1.16 的 HyperNode 控制器**（拓扑发现 + 超节点管理，独立部署），演进时直接复用而非自研。
+- **存算分离在你的方案里怎么体现？**
+  三层分离：节点分离（缓存集群独立 CPU 池，GPU 无状态化）、生命周期分离（数据集独立于集群）、调度协同（缓存亲和）；现状反差是现成的引子——MCK volume 随节点交付是存算耦合，超分 PDF 里 `egp-csi-nas` 的 CSI 注解证明平台有存储底子；一期不引入缓存的理由（规模小、复杂度后置）；对象存储选型和 Fluid×Volcano 集成机制如实说"未定稿，POC 核实"。
 - **这方案跟阿里 ACK GPU / 腾讯 TKE GPU 比呢？**
   它们绑定自家云 API 和控制面；MCK 智算的差异化在**订单驱动的资源池经营层**（超分对账 + 半自动扩缩容是自家 CPU 云验证过的方法论），以及 kubespray 层对国产 OS/国产卡的可控定制空间。
 
 ---
 
-## 9. 未确认项（面试不要编造，被追问就说"这块我没深入/没验证"）
+## 9. 理解深度要求：两个项目各要懂到哪一层（版本现状 2026-10-15 核实）
 
-1. **Volcano vGPU 的精确版本边界**：HAMi 官方文档只写 "volcano > 1.9"；具体哪个 minor 版本引入 `deviceshare.VGPUEnable` 参数名，未在本地验证（本地无 Volcano 源码）。表述用"较新版本（1.9+），POC 前钉死版本"。
+**版本现状（GitHub Releases 核实）**：
+
+| 项目 | 最新稳定版 | 发布日期 | 你手上的版本 | 面试口径 |
+|---|---|---|---|---|
+| HAMi | v2.10.0 | 2026-08-21（2.9: 2026-05-19） | 精读过 2.6.1 源码 | "精读 2.6.1，2.x 架构稳定；2.10 的 PodGroup/gang、动态 MIG 重构、DRA driver 独立出去我扫过 changelog" |
+| Volcano | v1.16.0 | 2026-10-14（1.15.3/1.14.6/1.13.5 补丁: 2026-09-30） | 文档级 + 方案使用其 CR/插件模型 | "vGPU 整合 1.9+ 即支持；1.16 刚发布的 NamespaceQueue/fairshare/HyperNode/DRA scoring 我关注了" |
+
+> **面试点（时效性加分，主动讲）**：
+> ① Volcano 1.16 的 **NamespaceQueue**（租户在自己 namespace 内管理队列层级与配额，管理员授权资源池）——与 MCK 的 `mck-<tenantId>` 租户 namespace 模型**天然对齐**，比原方案的"池级 Queue + hierarchy 子队列"更贴，方案用语直接升级；
+> ② **HyperNode**（独立部署的拓扑控制器）给多机训练拓扑亲和提供了上游件；
+> ③ HAMi 2.10 把 DRA driver 独立成单独仓库（如 ascend-dra-driver），Volcano 1.16 加入 DRA scoring —— **两个项目都在向 K8s DRA 收敛**，"演进到 DRA"从此有据可依；
+> ④ HAMi 2.10 新增 PodGroup/gang 支持说明上游自己也在解 gang 问题——路线 B 的劣势在上游收敛中，但官方整合路线仍是 volcano-vgpu。
+
+### 9.1 三层深度模型
+
+| 层 | 要求 | 判断标准 |
+|---|---|---|
+| **L1 方案层（必须）** | HAMi：组件拓扑（scheduler / device-plugin / HAMi-core / vGPUmonitor）、两条整合路线、资源名（`volcano.sh/vgpu-*` vs `nvidia.com/gpu`）、隔离等级（应用态 hook / MIG / 独占） | 能画出整合架构图；能讲"一条 Pod 从提交到拿到卡"的完整数据流 |
+| **L2 机制层（防御纵深）** | HAMi：注解流转（`hami.io/vgpu-devices-to-allocate` → `allocated`）、NodeLock 语义、配额下发（env + LD_PRELOAD）；Volcano：session 调度循环、capability/deserved/weight 各管什么、reclaim vs preempt 区别、Pending 原因可观测性 | 被钻"它怎么实现的"能答到字段/流程级；报不出源码行号没关系 |
+| **L3 源码层（一口深井即可，不求通读）** | 选 1–2 个点打穿（建议：HAMi scheduler 的 bind 流程，或 device plugin 注册/上报机制——本地有 2.6.1 源码，成本最低） | 被问"读过源码吗"，能讲出 1 个具体机制到源码级 |
+
+**不需要达到的**：Volcano 全部插件源码通读、contributor 级理解、生产调参经验——被问到就用 §7 POC 清单接。
+
+### 9.2 自查五问（全部能答 = 够格讲方案）
+
+1. 一条 GPU Pod 从 kubectl apply 到容器内拿到 `CUDA_VISIBLE_DEVICES`，中间经过哪些组件，哪些注解被写入、谁写的？
+2. PodGroup minAvailable=8 而可用卡只有 5 时，Volcano 的行为链（enqueue→Pending→事件原因）？
+3. 申请 vgpu-memory 3G 的容器试图分配第 4G 时发生什么？在哪一层拦截？绕过 CUDA API 会怎样？
+4. Queue 的 capability / deserved / weight 各自决定什么？reclaim 什么时候触发？
+5. device plugin 挂了，存量 Pod / 新建 Pod 各是什么行为，你的对账器会看到什么？
+
+---
+
+## 10. 未确认项（面试不要编造，被追问就说"这块我没深入/没验证"）
+
+1. **Volcano vGPU 的精确版本边界**：HAMi 官方文档只写 "volcano > 1.9"；具体哪个 minor 引入 `deviceshare.VGPUEnable` 参数名未逐版本核实（本地无 Volcano 源码）。最新 v1.16.0（2026-10-14）远超该边界，POC 前钉死版本。
 2. **Node capacity 字段名**：官方文档示例里 Node 上报的是 `volcano.sh/gpu-number/gpu-memory`，Pod 申请用的是 `volcano.sh/vgpu-number` 前缀——两套前缀的对应关系需在 POC 时以实际部署为准，文档示例可能与版本有关。
 3. **HAMi scheduler 内部形态**：2.6.1 源码显示它是独立二进制（cobra + httprouter，含 webhook 与 extender 路由），但与 kube-scheduler framework 的确切关系（fork 还是纯 extender）未逐行确认——面试只说"独立调度器组件 + webhook 机制"，不深入其内部注册方式。
 4. **HAMi-core 隔离的具体覆盖面**（哪些 CUDA API 被拦截、NCCL 路径的实际行为）：未做源码级阅读，只引用官方定位（基于 HAMi-core 的设备共享）。隔离强度结论以 POC benchmark 为准。
 5. **云监控计费接口细节**：GPU 计量事件的具体 API/字段未确认（PDF 中 CPU 侧也只是"与云监控 sre 对齐"待办），面试讲"口径设计"不讲"接口已通"。
 6. **MCK portal 侧 AI 任务表**：链路 3 产品化阶段才需要，表结构未设计——主动说"MVP 不含"。
 7. **超分 PDF 的署名与参与度**：该方案作者是江振瑜，你按"团队方案，我掌握其机制并迁移设计"来讲，除非你实际参与——**参与度你自己最清楚，按实际讲**。
+8. **对象存储与缓存组件选型**：L0 用什么（公司存储产品线 / 开源 S3 兼容）、L1 选 JuiceFS/CubeFS/Fluid 系，均未调研定稿——面试讲"选型维度"（S3 兼容性、元数据引擎、私有云部署成本），不讲"已选定"。
+9. **Fluid × Volcano 缓存亲和集成的具体机制**（标签协同还是 scheduler plugin）：未核实，POC 项。
 
 ---
 
-## 10. 面试前 Checklist
+## 11. 面试前 Checklist
 
 - [ ] §0 电梯版脱稿 30 秒
 - [ ] §1 映射表能默写 5 行以上（证明"复用自有资产"）
 - [ ] §3.4 CPU→GPU 超分映射表（最有辨识度的一条，能讲 2 分钟）
+- [ ] §3.5 存算分离三层含义 + 现状反差（volume 随节点走 = 存算耦合 → "数据不动、算力流动"）
 - [ ] §4.4 三条路线的取舍理由，尤其是"官方文档原话收敛选型"
 - [ ] §4.5 隔离等级：HAMi-core=应用态 hook，MIG=硬隔离，大训练=独占
 - [ ] §5 分期计划的三个"不做什么"
 - [ ] §7 四条红线 + POC 清单五条
-- [ ] §9 未确认项记牢
+- [ ] §9 版本现状表 + 三层深度模型 + 自查五问（被问"懂多深"时的标准答案）
+- [ ] §10 未确认项记牢
 - [ ] 与另外两份材料的比例：真实经历为主（mck/cni），本文讲 5–6 分钟收口
