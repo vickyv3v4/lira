@@ -1,7 +1,7 @@
 # 智算云 PaaS 平台架构师 · 面试准备总清单（精简版）
 
 > 策略：**面试不是 JD 符合度检查。赢法 = 两条真实流程讲透（主菜，占面试 80%）+ 其余话题各备 1-3 句弹药不穿底。**
-> 内容细节：interview-prep-mck.md / interview-prep-cni.md / interview-prep-mck-gpu.md（v1 骨架+红线+POC）+ **mck-gpu-platform-design.md（正式设计文档，GPU 话题的主内容源）**。本文件只管"练什么、练到什么程度"。
+> 内容细节：interview-prep-mck.md / interview-prep-cni.md / interview-prep-mck-gpu.md（v1 骨架+红线+POC）+ **mck-gpu-platform-design.md（正式设计文档，GPU 话题的主内容源）** + mck-ai-platform-design.md（技术方案落地版：技术栈总表/部署拓扑/CRD 与配置样例/验收标准）。本文件只管"练什么、练到什么程度"。
 
 ---
 
@@ -35,6 +35,7 @@
 | 可观测 | "MCK 现状 categraf + kube-state-metrics 推云监控；GPU 场景加 DCGM-Exporter；排查用分层法" | mck §9.4 分层排查就是例证 |
 | 微服务治理 | "注册发现/配置中心用 Nacos（真实）；网关 nginx-ingress；Mesh 的观点：金融私有云不急着上 sidecar，关注 Ambient 演进" | 观点题，无标准答案 |
 | 多集群 | "MCK 按 poolCode 分元集群解决（真实机制）；Karmada 是演进选项，看过 1.14 的 Resource/PropagationPolicy 派发" | gpu §5 演进行 |
+| 总体架构 | "智算三层：MCK 底座管稳定供给、智算平台管算力使用优化、LLMOPS 管业务闭环；层间契约只有 K8s API；LLMOPS 复用 MCK portal/res/ctl/plt 模式再实例化" | 总体设计 §1/§2/§5 |
 | 竞品 | GPU 共享一行表：**HAMi**（开源，应用态 CUDA hook）/ **阿里 cGPU**（内核级）/ **华为 XGPU** / **腾讯 qGPU**；平台差异按 mck §13 | 只备一行，追问再展开 |
 | 源码能力 | 任选 1 个打穿当"井"：HAMi bind 流程（本地 2.6.1 源码）或 MCK actor 防双跑 | gpu §9.1 L3 深度模型 |
 
@@ -48,6 +49,7 @@
 - [ ] CNI：Pod 起来没 IP 的排查链路（cni §2.6）
 - [ ] CNI：为什么双接口 + 为什么要永久 ARP（cni §2.2）
 - [ ] GPU：双调度器三条路线取舍，用官方文档原话收敛（gpu §4.4）
+- [ ] GPU：三层架构每层卖什么 + 层间契约只有 K8s API + LLMOPS=MCK 四层模式再实例化（总体设计 §1.1/§2.2/§5.1）
 - [ ] GPU：**512 卡任务掉一张卡，10 分钟时序**（设计文档 §4.5.1）
 - [ ] GPU：HAMi-core 隔离强度 + MIG 边界（设计文档 §4.2 + gpu §4.5）
 - [ ] GPU：没上线怎么保证能落地 → POC 清单 5 条（gpu §7）
