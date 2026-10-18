@@ -16,6 +16,7 @@
 | eBPF 网络策略（NetworkPolicy on 共享 ENI） | **设计方案（评审稿）** | 共享ENI-EBPF网络策略设计方案.md |
 | Service 数据面 eBPF（替换 kube-proxy） | **设计方案（评审稿）** | SVC-eBPF实现方案-独占与共享ENI.md |
 | RDMA 网络资源化（RdmaNic CRD / VF 插件） | **设计方案（未实施，演进项）** | mck-ai-platform-design.md §3.4；mck-gpu-platform-design.md |
+| 开源 RDMA 链路机制（sriovdp + multus + sriov-cni + whereabouts） | **源码逐行研读（非自研，落地选型依据）** | 本地两个仓库代码 + kubelet v0.36 deviceplugin API（§5.2） |
 
 **开场定位（一句话，主动说，把面试官的预期校准）：**
 
@@ -150,7 +151,7 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 
 ---
 
-## 5. RDMA 网络支持 for AI（设计方案——lira 与 AI Infra 的连接点）
+## 5. RDMA 网络支持 for AI（开源机制解剖 + 设计方案——lira 与 AI Infra 的连接点）
 
 ### 5.1 为什么 AI 需要 RDMA（30 秒）
 
@@ -158,23 +159,46 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 
 （来源：mck-ai-platform-design.md §2.1/§3.4；训练 BMS 网络走 RoCE/IB 见 mck-gpu-platform-design.md §4.1.2）
 
-### 5.2 一期：开源插件先落地（30 秒）
+### 5.2 开源链路实现机制解剖（代码级，可深钻——不是"背方案"而是"读过源码"）
 
-> "一期用开源的 k8s-rdma-shared-dev-plugin，把 RDMA VF 注册成扩展资源 `rdma/hca_shared`，作业请求 `rdma/hca_shared: 1` 加 nodeSelector 选 RDMA 节点池；NCCL 经 VF 通信，GPUDirect RDMA 需要的 IOMMU/vfio 主机配置列为 POC 验证项。"
+**一句话定位（先把认知框架立住）：**
 
-### 5.3 演进：RdmaNic CRD，复用 lira 模式（核心，1 分钟）
+> "K8s 里 RDMA 的容器可见性不是 CNI 给的，是 device plugin 通过 Device Plugin API 的 DeviceSpec 直挂的：kubelet 在 Allocate 阶段收到 `/dev/infiniband/uverbsX` 设备节点列表，创建容器时直接挂进去。CNI（sriov-cni）从头到尾不碰 RDMA——我通读了它 master 全部 git 历史，`--grep rdma` 零个 commit。所以容器 RDMA 是两条平行线：**设备挂载走 device plugin 层，数据面接口走 CNI 层**，各管各的。"
+
+**五步链路口述（1 分钟，落地链路=multus + sriovdp + sriov-cni + whereabouts）：**
+
+> "1. sriov-network-device-plugin 按配置 `isRdma: true` 选择器发现 VF：Mellanox 读 `/sys/bus/pci/devices/<addr>/infiniband/` 拿 RDMA 设备名（mlx5_5），Intel E810 走 devlink 参数 `enable_rdma`；把 VF 注册成扩展资源 `mellanox.com/mlnx_rdma`。2. Pod 请求该资源，kubelet 调 Allocate 返回 DeviceSpec + env + 可选 CDI annotation。3. multus 从 kubelet **PodResources API** 查到该 Pod 分到的 VF PCI 地址（deviceID），注入委托给 sriov-cni 的 CNI 配置。4. sriov-cni 拿着 deviceID 配 VLAN/MAC、把 VF netdevice 移进 Pod netns、改名、UP，再调 whereabouts 分 IP。5. 容器里同时具备 `/dev/infiniband/uverbsN`（kubelet 挂的）和 VF 网卡（CNI 配的），这就是 RDMA 应用看到的全部。"
+
+**Allocate 到底返回什么（能背出原型是加分项）：**
+
+> "gRPC 返回 `AllocateResponse`，每容器一个 `ContainerAllocateResponse`，四字段：`Devices []DeviceSpec`（HostPath/ContainerPath/Permissions——RDMA 就是 /dev/infiniband/* 设备节点）、`Mounts`、`Envs`（PCIDEVICE_ 前缀，含 _INFO JSON 里的 uverbs 路径和 rdma_dev 名）、`Annotations`（CDI 模式给运行时）。这四样 kubelet 原样下发 CRI，最后落在 OCI 容器的 device 配置里。"
+
+**三个高频追问预案：**
+
+- **"multus 查 deviceID 有什么用？"** 作用是把"抽象资源账本"对齐到"真实硬件"：Pod 能跑 RDMA，前提是三个东西指同一个 VF——kubelet 记账并挂设备节点的那个、netns 里配 IP 的那个、扩展资源上报的那个；deviceID（PCI 地址）是三者的信物。sriov-cni 还拿它做 pci_allocator 加锁，防两个 Pod 抢同一 VF（旧 Pod DEL 与新 Pod ADD 竞态）。
+- **"节点/容器重启 RDMA 怎么恢复？"** 分三档：容器重启——sandbox netns 不重建，VF 和 IP 原样还在，kubelet 重建容器时 device manager 按记录重新挂设备节点，自动恢复；kubelet 重启——device manager 从 checkpoint 恢复分配，插件探测到 socket 变化自动重注册重 ListAndWatch，exclusive 模式下被占设备的 sysfs 文件没了、靠 devlink 参数兜底继续上报（这正是插件源码里明写的场景）；整节点重启——VF 回宿主 netns，Pod 重建走全流程 ADD，whereabouts 按 CRD 分配记录把同一个 IP 还给同一个 Pod，旧 netns 不存在时 CmdDel 对 NSNotExist 静默放行。
+- **"sriov-cni 没有 RDMA 代码，RDMA 的 netns 隔离怎么保证？"** 这是开源链路的明确边界：共享模式靠"每 VF 独立 RDMA 设备实例（mlx5_N）+ 设备节点直挂"保证应用级隔离；netns 级 RDMA 设备隔离（把 RDMA 设备 move 进 Pod netns）在社区 master 里没有，只有 fork/定制版本实现过——这正是自研 RdmaNic 隔离态的演进动机之一。
+- **"节点重启后，Pod 还能拿到上次的那个 VF 吗（vf1 会不会变 vf2）？"** 分两层：**硬件层**——VF 的唯一身份是 PCI 地址，固件决定 VF 枚举顺序，同机重启后 VF k 还是那个地址（前提：硬件/插槽/BIOS 不变）；**记账层**——"谁用哪个 VF"记在 kubelet device manager 的 checkpoint（/var/lib/kubelet/device-plugins/kubelet_checkpoint），节点重启后 Pod 重建走 Allocate 时同 podUID 直接复用记录的 deviceID，不重新挑。**会换 VF 的场景**：Pod 删了重建（新 UID 重挑）、checkpoint 丢失、换卡/换插槽/BIOS 变更导致 PCI 枚举变化、Pod 换节点。整条链路对"VF 换了"是容忍的：RDMA 设备名（mlx5_N）和 uverbs 编号重启后本就可能漂移，device plugin 每次分配从 sysfs 现查映射（rdmamap）、multus 每次 ADD 现查 PodResources——稳定锚点始终是 PCI 地址，IP 由 whereabouts 按记录归还。
+
+（来源：sriov-network-device-plugin / sriov-cni 两个本地仓库源码逐行 + kubelet v0.36 deviceplugin API 类型 + sriov-cni `git log --grep rdma` 零命中；checkpoint 行为属 kubelet 通用机制，细节以部署版本源码为准）
+
+### 5.3 一期：开源插件先落地（30 秒）
+
+> "一期用开源的 k8s-rdma-shared-dev-plugin，把 RDMA VF 注册成扩展资源 `rdma/hca_shared`，作业请求 `rdma/hca_shared: 1` 加 nodeSelector 选 RDMA 节点池；NCCL 经 VF 通信，GPUDirect RDMA 需要的 IOMMU/vfio 主机配置列为 POC 验证项。选型前提是我把这套 Device Plugin 机制的底层解剖透了（§5.2）——知道它给的是什么（设备节点直挂）、不给的是什么（netns 级 RDMA 隔离），自研演进才有靶子。"
+
+### 5.4 演进：RdmaNic CRD，复用 lira 模式（核心，1 分钟）
 
 > "开源插件只解决'能用'，不解决'按需分配与隔离'。我的设计是**把 lira 的模式整体平移过来**：自研 RdmaNic CRD 加状态机（Allocatable → Assigned → Isolated），节点 daemon 管理 VF，调度侧加 Filter 做 NIC 配额校验——**和 PodENI 完全同构**。CR 上记录 nodeName、PF、vfIndex、state、owner Pod。这样获得三样开源插件给不了的能力：单 NIC 粒度的分配与隔离、NIC 故障的隔离态管理（对应 GPU 方案的摘卡时序）、以及**支撑 PD 分离推理的 KV 传输 QoS**。"
 
 （来源：mck-ai-platform-design.md §3.4，含 RdmaNic CRD YAML 示例）
 
-### 5.4 同构论证（被追问"凭什么说能平移"时）
+### 5.5 同构论证（被追问"凭什么说能平移"时）
 
 > "三段同构：**云/硬件资源 → CR 状态机**（ENI 生命周期 ↔ VF 生命周期，都靠 finalizer 防泄漏）；**节点 daemon**（等 Bind 返回配置 ↔ VF 就绪返回配置）；**调度感知**（msxf.com/eni 扩展资源 ↔ rdma 扩展资源，都是 allocatable 打满即 Filter 掉）。lira 已经把'配额前移到调度器'的完整方案趟过一遍（§3 的 Webhook 方案），RDMA 直接继承。"
 
-### 5.5 诚实边界（主动说）
+### 5.6 诚实边界（主动说）
 
-> "RoCE/IB 训练网络本身（无损参数、组网）是独立网络专项，我们的方案只定义接口；RDMA 部分目前是设计，POC 清单里 GPUDirect RDMA 的 IOMMU/vfio 验证还没做。"
+> "RoCE/IB 训练网络本身（无损参数、组网）是独立网络专项，我们的方案只定义接口；开源链路机制我读到了代码级（§5.2），但没有在集群上实际运维过；自研 RdmaNic 目前是设计，POC 清单里 GPUDirect RDMA 的 IOMMU/vfio 验证还没做。"
 
 （来源：mck-gpu-platform-design.md §1.4 非目标——"RoCE/IB 训练网络设计：独立网络专项，本方案只定义接口"）
 
@@ -194,7 +218,8 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 - [ ] §3 配额问题→方案一句话→两模块，能画前后对比
 - [ ] §4.1 两个死结 + §4.4"只读只写"金句背熟
 - [ ] §4.5 三个"为什么不上 XX"备好
-- [ ] §5.3 RdmaNic 同构论证三点
+- [ ] §5.2 开源链路：五步口述 + Allocate 四字段 + deviceID 三作用 + VF 重启归属四连追问
+- [ ] §5.4 RdmaNic 同构论证三点
 - [ ] §6 主线收口脱稿
 - [ ] 诚信分层表（§0）开场主动讲——**分层定位本身就是加分项**
 - [ ] 数字空着不编：ADD 端到端耗时、数据面耗时、attach 延迟、集群规模（interview-prep-cni.md §3 空表）
@@ -203,5 +228,5 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 
 1. 共享 ENI 分支（feature-multi-eniip）的实现细节以 PDF 主文档为准，eBPF 方案文档仅引用其接口命名（eth1/eth2=ENI、容器内 eth0=ipvlan 口、veth1=宿主通信口）。
 2. eBPF 方案的挂载点顺序标注"内核源码已核对"，但具体内核版本（clsact 4.5 / LRU 4.10 / lpm 4.11 / ringbuf 5.8）是方案前提，未在目标环境逐台验证过——被问就说"方案里列了版本矩阵，实施前要 `uname -r` 逐项核对"。
-3. RDMA 全部为设计：GPUDirect RDMA 的 IOMMU/vfio 配置验证是 POC 项；PD 分离（KV 传输依赖 RDMA）是二期 POC 前置项。
+3. RDMA 分层：开源链路机制（§5.2）为源码研读结论、代码级可深钻，但未在集群实操验证；自研 RdmaNic 全部为设计——GPUDirect RDMA 的 IOMMU/vfio 配置验证是 POC 项，PD 分离（KV 传输依赖 RDMA）是二期 POC 前置项。kubelet device manager checkpoint / PodResources API 属 kubelet 通用机制（非本项目代码），细节以所部署 K8s 版本源码为准。
 4. 性能数字（eBPF vs iptables、缓存命中收益等）方案明确"不预设收益数字，以可复现实验为准"——面试同样不给数字，给验证方法。
