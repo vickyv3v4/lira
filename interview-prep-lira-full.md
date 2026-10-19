@@ -171,11 +171,11 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 
 **Allocate 到底返回什么（能背出原型是加分项）：**
 
-> "gRPC 返回 `AllocateResponse`，每容器一个 `ContainerAllocateResponse`，四字段：`Devices []DeviceSpec`（HostPath/ContainerPath/Permissions——RDMA 就是 /dev/infiniband/* 设备节点）、`Mounts`、`Envs`（PCIDEVICE_ 前缀，含 _INFO JSON 里的 uverbs 路径和 rdma_dev 名）、`Annotations`（CDI 模式给运行时）。这四样 kubelet 原样下发 CRI，最后落在 OCI 容器的 device 配置里。"
+> "gRPC 返回 `AllocateResponse`，每容器一个 `ContainerAllocateResponse`，四字段：`Devices []DeviceSpec`（HostPath/ContainerPath/Permissions——RDMA 就是 /dev/infiniband 下的设备节点）、`Mounts`、`Envs`（PCIDEVICE_ 前缀，含 _INFO JSON 里的 uverbs 路径和 rdma_dev 名）、`Annotations`（CDI 模式给运行时）。这四样 kubelet 原样下发 CRI，最后落在 OCI 容器的 device 配置里。"
 
 **三个高频追问预案：**
 
-- **"multus 查 deviceID 有什么用？"** 作用是把"抽象资源账本"对齐到"真实硬件"：Pod 能跑 RDMA，前提是三个东西指同一个 VF——kubelet 记账并挂设备节点的那个、netns 里配 IP 的那个、扩展资源上报的那个；deviceID（PCI 地址）是三者的信物。sriov-cni 还拿它做 pci_allocator 加锁，防两个 Pod 抢同一 VF（旧 Pod DEL 与新 Pod ADD 竞态）。
+- **"multus 查 deviceID 有什么用？在哪起作用？"** 作用是把"抽象资源账本"对齐到"真实硬件"：Pod 能跑 RDMA，前提是三个东西指同一个 VF——kubelet 记账并挂设备节点的那个、netns 里配 IP 的那个、扩展资源上报的那个；deviceID（PCI 地址）是三者的信物。multus 本身只注入不使用；落到 sriov-cni 代码上，deviceID 被翻译成**三个操作坐标**：① **(PF 名, VFID)**——VF 的 VLAN/MAC/限速/spoofchk 属性必须经 PF 的 netlink 按 VFID 下发，不能在 VF 自己接口上配；② **宿主 netdev 名**——SetupVF 搬进 Pod netns 的就是它（绑了 DPDK 驱动也从此判定）；③ **锁与占用标记的 key**——pci_allocator 防两个 Pod 抢同一 VF（旧 Pod DEL 与新 Pod ADD 竞态）。deviceID 为空 sriov-cni 直接报错"VF pci addr is required"，插件没有任何自主选卡逻辑——反证它就是唯一入口。
 - **"节点/容器重启 RDMA 怎么恢复？"** 分三档：容器重启——sandbox netns 不重建，VF 和 IP 原样还在，kubelet 重建容器时 device manager 按记录重新挂设备节点，自动恢复；kubelet 重启——device manager 从 checkpoint 恢复分配，插件探测到 socket 变化自动重注册重 ListAndWatch，exclusive 模式下被占设备的 sysfs 文件没了、靠 devlink 参数兜底继续上报（这正是插件源码里明写的场景）；整节点重启——VF 回宿主 netns，Pod 重建走全流程 ADD，whereabouts 按 CRD 分配记录把同一个 IP 还给同一个 Pod，旧 netns 不存在时 CmdDel 对 NSNotExist 静默放行。
 - **"sriov-cni 没有 RDMA 代码，RDMA 的 netns 隔离怎么保证？"** 这是开源链路的明确边界：共享模式靠"每 VF 独立 RDMA 设备实例（mlx5_N）+ 设备节点直挂"保证应用级隔离；netns 级 RDMA 设备隔离（把 RDMA 设备 move 进 Pod netns）在社区 master 里没有，只有 fork/定制版本实现过——这正是自研 RdmaNic 隔离态的演进动机之一。
 - **"节点重启后，Pod 还能拿到上次的那个 VF 吗（vf1 会不会变 vf2）？"** 分两层：**硬件层**——VF 的唯一身份是 PCI 地址，固件决定 VF 枚举顺序，同机重启后 VF k 还是那个地址（前提：硬件/插槽/BIOS 不变）；**记账层**——"谁用哪个 VF"记在 kubelet device manager 的 checkpoint（/var/lib/kubelet/device-plugins/kubelet_checkpoint），节点重启后 Pod 重建走 Allocate 时同 podUID 直接复用记录的 deviceID，不重新挑。**会换 VF 的场景**：Pod 删了重建（新 UID 重挑）、checkpoint 丢失、换卡/换插槽/BIOS 变更导致 PCI 枚举变化、Pod 换节点。整条链路对"VF 换了"是容忍的：RDMA 设备名（mlx5_N）和 uverbs 编号重启后本就可能漂移，device plugin 每次分配从 sysfs 现查映射（rdmamap）、multus 每次 ADD 现查 PodResources——稳定锚点始终是 PCI 地址，IP 由 whereabouts 按记录归还。
