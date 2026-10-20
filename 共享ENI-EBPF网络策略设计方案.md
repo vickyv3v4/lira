@@ -112,6 +112,57 @@ ipvlan 所有子口共用 ENI 的 MAC，身份只能用 IP 表达：
 | 访问SVC后端同节点 | veth出向（DNAT后：src=真实源pod，dst=后端IP，一次同时查源的egress与后端的ingress策略） | 同左 |
 | 访问集群外ECS | 主口出向（CIDR 规则） | — |
 
+### 4.1 数据流全景图（网口、netns 边界与四挂载点）
+
+```
+                     VPC 云网络 ═══════════════════════════════════
+                        ▲ │ pod 出向                      ▲ │ 入向（外部/跨节点）
+                        │ ▼ ①主口出向                     │ ▼ ②主口入向
+┌───────────────────────┴─┴───────── 宿主机 netns ──────────────────────────┐
+│                                                                          │
+│  [ENI 主口 eth1]（所有 ipvlan 子口共用其 MAC；ipvlan 父口）                  │
+│     ├─① tc-egress 主口出向：pod_ip[src]→身份A / pod_ip[dst]→身份B          │
+│     │        ct 命中放行；否则查 policy(A→B,协议,端口) → 写 ct / SHOT        │
+│     │        源校验：src ∈ 本节点已分配 IP（防未分配 IP 出网）                │
+│     │        ★ slave 出向包内核切到主口发出，tc egress 在 qdisc 之前         │
+│     ├─② tc-ingress 主口入向：查 dst 身份 → ct / ingress policy → 放行       │
+│     │        ★ tc ingress 在 ipvlan rx_handler 之前（分发前拦截）           │
+│     │                                                                    │
+│     ├╌╌ ipvlan 分发（rx_handler）╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┐  （直投进 pod 的 eth0，   │
+│     │                                            │    宿主机侧无该口实体） │
+│  [liraxxxx] veth·host端        [lirayyyy] veth·host端                       │
+│     └─③ tc-egress veth出向：宿主机路由到 pod 的流量                          │
+│              （host→pod、SVC 后端投递——kube-proxy DNAT 后 src 仍是           │
+│                pod 真实 IP，一次同时查源 egress + 后端 ingress 策略）          │
+└──────┬───────────────────────────────────┬─────────────────────────────────┘
+       │ veth1                             │ veth1
+┌──────┴───────────┐          ┌────────────┴────┐        ┌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┐
+│ pod1 netns       │          │ pod2 netns      │        │ 同ENI直投不进  │
+│ [veth1] 宿主通信 │          │ [veth1]         │        │ 宿主机协议栈， │
+│ [eth0] ipvlan 子口│         │ [eth0] ipvlan 口 │        │ iptables 不可 │
+│   └─④ tc 双向：  │◄═内核直投═►│   └─④ tc 双向： │        │ 见 → ④唯一落点 │
+│      出向：源IP  │  (不过主口)│      入向：dst= │        └╌╌╌╌╌╌╌╌╌╌╌╌╌╌┘
+│      校验(slave_ │           │      本pod IP + │
+│      src)+egress │           │      ingress策略│
+└──────────────────┘          └─────────────────┘
+```
+
+三条典型链路走包箭头（逐步走包见 §5.3）：
+
+```
+链路一 跨节点 pod1→pod2：pod1.eth0 ─④出(源校验)→ eth1 ─①─→ VPC → 对端eth1 ─②─→ 分发 → pod2.eth0
+链路二 同ENI pod1→pod2 ：pod1.eth0 ─④出(源校验+策略)→ ══内核直投(不过主口)══ → pod2.eth0 ─④入→ pod2
+链路三 SVC后端同节点    ：pod1.veth1 → liraxxxx ─③(DNAT后双向策略)→ pod2.veth1 → pod2
+```
+
+其余三条链路（节点→同节点 pod 走 ③、同节点不同 ENI 互访走 ①/②、访问集群外走 ①+CIDR）执行点对照见 §4 表。
+
+三条读图要点：
+
+- 同 ENI 直投是唯一绕过主口的路径 → ④ 是它唯一执行点；④ 也是唯一在 pod netns 内的程序，防摘除靠 daemon 周期性 reconcile（§7）；
+- ③ 存在的原因：host→pod 与 svc 后端投递走 veth 不走 ipvlan，主口两个钩子都看不到（§4 表）；
+- 有状态放回程：首包查 policy 通过后写 ct，回程与后续包 ct 命中直接放行不再查规则（§5.4）。
+
 ## 5. 主干流程
 
 ### 5.1 建链流程（pod 创建）
@@ -147,7 +198,7 @@ policy agent（lira-controller内）：
 
 关键性质：**数据面只读 map，控制面只写 map**。策略变更、pod 增删都只体现为 map 内容变化，转发程序自始至终不变。
 
-### 5.3 转发判定流程（数据面，三条典型链路逐步走包）
+### 5.3 转发判定流程（数据面，三条典型链路逐步走包；走包设备序列速查见 §4.1）
 
 **链路一：跨节点 pod1 → pod2**
 
@@ -233,3 +284,108 @@ ReleaseIP → 清 pod_ip / slave_src / policy 中该身份的条目 → detach �
 1. **一期**：pod_ip / slave_src / policy(CIDR粒度) + 主口出向/主口入向/pod口挂载——管住南北向和防伪造
 2. **二期**：NetworkPolicy 完整语义（标签选择、协议端口）+ veth出向程序，补齐同ENI东西向和svc路径
 3. **三期**：ct 有状态补全、策略命中 metrics、跨节点SVC真实源还原
+
+## 11. 附录：模块实现伪代码
+
+> 【伪代码，非可编译实现】表达各模块职责与数据流，API 以实现期选型为准（Go 侧 cilium/ebpf）。数据面程序每包执行，受 verifier 约束（§2）。编号①②③④ 对应 §4.1 图中的四个挂载点。
+
+### 11.1 控制面：policy agent（Go，lira-controller 内）
+
+```go
+// 数据面只读 map，控制面只写 map；条目按"身份对"组织（§3/§6）。
+// watch NetworkPolicy / Pod / PodENI，任一事件触发重算（§5.2）。
+onWatchEvent():
+  ids := computeLocalIdentities()          // PodIP → 身份ID（ns+labels 哈希）
+  for A := range ids {                     // 逐个本地身份
+    entries := []
+    for np := range policiesSelecting(A) { // 选中 A 的 NetworkPolicy
+      for peer := range np.peers() {       // 身份对；集群外网段 → CIDR（lpm 子表，§6）
+        for port := range np.ports() {     // 协议 + 端口
+          entries = append(entries, {A, peer, proto, port, ALLOW})
+        }
+      }
+    }
+    policyMap.ReplaceAll(A, entries)       // 全量替换：策略规模小，全量比增量收敛简单可靠（§5.2）
+  }
+  // 固定身份：节点自身 / hostNetwork pod 常驻表；集群外一律按 CIDR 判定（§3）
+```
+
+### 11.2 控制面：daemon 建链/回收/reconcile（Go，lira-daemon）
+
+```go
+// 建链：CNI AllocIP 成功返回后（§5.1）
+onAllocIPDone(pod):
+  createIpvlanAndVeth(pod)                        // 主口 ipvlan 子口（pod eth0）+ veth 宿主通信口
+  attach(pinnedPodProg → pod 内 ipvlan 口)         // ④ pod 口程序：从 pin 目录取对象 attach 新口
+  podIPMap.Update(podIP, identityID(pod))          // 身份表
+  slaveSrcMap.Update(ipvlanIfindex, podIP)         // 源校验白名单（防伪造第一层，§7）
+  attach(vethEgressProg → 宿主机 veth 口)           // ③
+
+// 回收：ReleaseIP（§5.5）
+onReleaseIP(pod):
+  podIPMap.Delete(podIP); slaveSrcMap.Delete(ipvlanIfindex)
+  policyMap.DeleteIdentity(identityID(pod))
+  detachAndClean(pod 内程序与 pin 条目)             // ct 条目留 LRU 自然过期
+
+// 防摘除（§7）：daemon 重启 / 程序被手动 detach 后自愈
+reconcileLoop():
+  周期对照 pin 目录与各口 filter，缺失即重挂
+```
+
+### 11.3 数据面①②：主口出向 / 入向（C）
+
+```c
+// ① ENI 主口 tc-egress：slave 出向包都从这里发出（§4.1，内核顺序源码已核对）
+SEC("tc/egress") int main_egress(skb) {
+  parse(eth/ip/l4);
+  if (src ∉ 本节点已分配IP集合) return TC_ACT_SHOT;  // 防伪造外层（§7 双层）
+  A = podIP[src]; B = podIP[dst];
+  if (ct_lookup(tuple)) return TC_ACT_OK;          // 已建立连接直接放行（有状态，§5.4）
+  if (policy_allow(A → B, proto, dport)) { ct_create(tuple, ALLOW); return TC_ACT_OK; }
+  return TC_ACT_SHOT;                              // 默认拒绝
+}
+
+// ② ENI 主口 tc-ingress：位于 ipvlan rx_handler 之前（§4.1，内核顺序源码已核对）
+SEC("tc/ingress") int main_ingress(skb) {
+  parse;
+  if (ct_lookup(reverse_tuple)) return TC_ACT_OK;  // 已建连接的回程放行
+  B = podIP[dst];
+  if (!B) return TC_ACT_OK;                        // 目的非本节点 pod → 节点自身/hostNetwork，固定身份（§3）
+  A = 源身份(命中 podIP) 或 CIDR;                   // 集群外按网段判定
+  if (policy_allow(A → B, ingress)) { ct_create; return TC_ACT_OK; }
+  return TC_ACT_SHOT;                              // 丢弃后不进入 ipvlan 分发（§5.3-链路2）
+}
+```
+
+### 11.4 数据面③：veth 出向（C）
+
+```c
+// ③ liraxxxx tc-egress：host→pod 与 SVC DNAT 后流量的合并策略点（§4.1/§5.3-链路3）
+SEC("tc/egress") int veth_egress(skb) {
+  parse;   // 到此 dst 已是后端 pod 真实 IP（DNAT 之后），src 未改
+  if (ct_lookup(tuple)) return TC_ACT_OK;
+  // 一次同时查两侧：源身份的 egress 策略 + 后端身份的 ingress 策略
+  if (policy_allow(src身份 → dst身份, egress) &&
+      policy_allow(src身份 → dst身份, ingress)) { ct_create; return TC_ACT_OK; }
+  return TC_ACT_SHOT;
+}
+```
+
+### 11.5 数据面④：pod 口双向（C，pod netns 内 ipvlan 口）
+
+```c
+// ④ 同 ENI pod 互访二层直投、不过主口 → 本口是唯一执行点（§4.1 读图要点3）
+SEC("tc/egress") int pod_egress(skb) {             // 源 pod 的 eth0
+  parse;
+  if (src != slaveSrc[ifindex]) return TC_ACT_SHOT; // 防同 ENI pod 间冒用源 IP（§7 第二层）
+  if (ct) return TC_ACT_OK;
+  return policy_allow(A→B, egress) ? (ct_create, TC_ACT_OK) : TC_ACT_SHOT;
+}
+
+SEC("tc/ingress") int pod_ingress(skb) {           // 目的 pod 的 eth0
+  parse;
+  if (dst != slaveSrc[ifindex]) return TC_ACT_SHOT; // 目的校验
+  if (ct) return TC_ACT_OK;
+  return policy_allow(A→B, ingress) ? (ct_create, TC_ACT_OK) : TC_ACT_SHOT;
+}
+```

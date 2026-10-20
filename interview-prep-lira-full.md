@@ -50,7 +50,7 @@
 > 4. kubelet 起 sandbox，调 **CNI ADD**，stdin 传 netconf，CNI_ARGS 传 Pod 名/namespace。
 > 5. 插件通过 unix socket 调 daemon 的 AllocIP，daemon 读 PodENI **指数退避等 Bind**，返回 IP/MAC/PodCIDR/网关。
 > 6. 插件**按 MAC 反查主机上 ENI 的 ifindex**——因为 Attach 是异步的，网卡可能刚出现在主机上——然后 LinkSetNsFd 把 ENI 移入 Pod netns，改名 eth0，配 IP、默认路由走 VPC 网关、PodCIDR 路由。
-> 7. 建 **veth 对**：Pod 侧 lira0 配同款 Pod IP，Service CIDR 路由 via 169.254.1.1，加对 169.254.1.1 的永久 ARP；host 侧配 169.254.1.1/32 加回 Pod IP 的 /32 路由。
+> 7. 建 **veth 对**（Pod 侧接口名 **veth1**，host 侧 `lira`+hash）：veth1 **不配 IP**，纯 Service 导流口——配 169.254.1.1/32 scope link + Service CIDR via 169.254.1.1（onlink）+ 节点 IP/32 via 169.254.1.1，加对 169.254.1.1 的永久 ARP；host 侧配 169.254.1.1/32 加回 Pod IP 的 /32 路由 + **PodIP→podVethMac 永久 ARP**（永久 ARP 两侧都写死，两侧 veth 的 MAC 都是插件自生成）。
 > 8. 回写 Pod event（AllocIPSucceed 加耗时），输出 CNI Result 给 kubelet。"
 
 （来源：interview-prep-cni.md §1 ADD 八步）
@@ -63,7 +63,7 @@
 
 - **为什么用 CRD 不在 daemon 里直接调 OpenAPI？** 三点：云 API 异步可能失败，需要可重入的协调，CR+reconcile 天然幂等断点续做；云资源拓扑持久化，controller 重启从 CR 续走不重复建 ENI；可观测，`kubectl get podeni` 直接看 IP/Node/Phase。和 Terway 的 PodENI、hybridnet 一致。
 - **为什么按 MAC 找网卡？** 插件和 controller 解耦，Attach 异步完成后主机上唯一可靠的关联键是 MAC。
-- **为什么 Pod 里双接口（ENI + veth lira0）？** ENI 直通后默认路由走 VPC 网关，但 VPC 网关不认识 ClusterIP——Service 的包出 ENI 就被丢。所以 Service CIDR 单独路由到 lira0 → 169.254.1.1 → host 上的 kube-proxy 做 Service 转换；VPC 流量走 ENI 保持原生 IP 和性能。Calico 的 169.254.1.1 同款。
+- **为什么 Pod 里双接口（ENI + veth1）？** ENI 直通后默认路由走 VPC 网关，但 VPC 网关不认识 ClusterIP——Service 的包出 ENI 就被丢。所以 Service CIDR 单独路由到 veth1 → 169.254.1.1 → host 上的 kube-proxy 做 Service 转换；VPC 流量走 ENI 保持原生 IP 和性能。Calico 的 169.254.1.1 同款。
 - **ENI 怎么移进 Pod netns？** netlink LinkSetNsFd；netns 切换要 LockOSThread 锁 OS 线程。
 - **竞态与一致性？** PodENI 名称=Pod 名一对一；Pod 重建比对 pod-uid annotation 不同则删旧建新；AllocIP 指数退避（10s 起、factor 2、5 步）等 Bind，插件侧 120s 超时。**主动讲参数 bug**：退避总上限约 310s 大于 CNI 120s 超时，参数没对齐——能指出自己系统的边界问题是强信号。
 
@@ -180,7 +180,41 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 - **"sriov-cni 没有 RDMA 代码，RDMA 的 netns 隔离怎么保证？"** 这是开源链路的明确边界：共享模式靠"每 VF 独立 RDMA 设备实例（mlx5_N）+ 设备节点直挂"保证应用级隔离；netns 级 RDMA 设备隔离（把 RDMA 设备 move 进 Pod netns）在社区 master 里没有，只有 fork/定制版本实现过——这正是自研 RdmaNic 隔离态的演进动机之一。
 - **"节点重启后，Pod 还能拿到上次的那个 VF 吗（vf1 会不会变 vf2）？"** 分两层：**硬件层**——VF 的唯一身份是 PCI 地址，固件决定 VF 枚举顺序，同机重启后 VF k 还是那个地址（前提：硬件/插槽/BIOS 不变）；**记账层**——"谁用哪个 VF"记在 kubelet device manager 的 checkpoint（/var/lib/kubelet/device-plugins/kubelet_checkpoint），节点重启后 Pod 重建走 Allocate 时同 podUID 直接复用记录的 deviceID，不重新挑。**会换 VF 的场景**：Pod 删了重建（新 UID 重挑）、checkpoint 丢失、换卡/换插槽/BIOS 变更导致 PCI 枚举变化、Pod 换节点。整条链路对"VF 换了"是容忍的：RDMA 设备名（mlx5_N）和 uverbs 编号重启后本就可能漂移，device plugin 每次分配从 sysfs 现查映射（rdmamap）、multus 每次 ADD 现查 PodResources——稳定锚点始终是 PCI 地址，IP 由 whereabouts 按记录归还。
 
-（来源：sriov-network-device-plugin / sriov-cni 两个本地仓库源码逐行 + kubelet v0.36 deviceplugin API 类型 + sriov-cni `git log --grep rdma` 零命中；checkpoint 行为属 kubelet 通用机制，细节以部署版本源码为准）
+**multus 拿 deviceID 的完整过程（multus master 源码逐行核对过，1 分钟）：**
+
+> "先把结论立住：**deviceID 不是从 multus 配置文件读的，是 CNI ADD 时实时查 kubelet 的资源分配账本**。五步：**一，触发前提**——NAD 必须带 `k8s.v1.cni.cncf.io/resourceName` 注解，没有它 multus 压根不查资源、deviceID 为空，sriov-cni 直接报 'VF pci addr is required'——手写 NAD 忘带注解是运维第一坑。**二，取 Pod 身份**——用 CNI_ARGS 里的 Pod 名/namespace 去 API Server 拿完整 Pod 对象（含 UID）。**三，惰性建 resourceMap**——遇到第一个带注解的 NAD 才建：首选 dial `/var/lib/kubelet/pod-resources/kubelet.sock` 调 PodResources API 的 ListPodResources，拿 kubelet device manager 维护的'Pod→容器→资源名→设备ID'全量快照；**socket 文件不存在就降级**直接读 checkpoint 文件 `/var/lib/kubelet/device-plugins/kubelet_internal_checkpoint`。**四，匹配聚合**——API 路径按 Pod 名+namespace 匹配、checkpoint 路径按 PodUID 匹配，把该 Pod 所有容器的设备按资源名聚合、排序，得到 `{资源名: [PCI地址列表]}`。**五，按序取号注入**——用注解里的资源名查 map，取 `DeviceIDs[Index]` 后 Index++（同 Pod 挂多个同资源 NAD 依次分配），`addDeviceIDInConfList` 把 `"deviceID": "0000:xx"` 写进委托配置的每个 plugin JSON——sriov-cni 的 stdin 里就有了。"
+
+**multus 侧追问预案（四连）：**
+
+- **"NAD 不带 resourceName 注解会怎样？"** deviceID 为空，sriov-cni LoadConf 直接报 "VF pci addr is required"，插件没有任何自主选卡逻辑。SR-IOV Network Operator 生成的 NAD 会自动带这个注解；手写 NAD 排查第一点就是它。
+- **"什么时候走 API、什么时候走 checkpoint？"** 按 socket 文件是否存在判定（`/var/lib/kubelet/pod-resources/kubelet.sock`）。两个后端的匹配键还不一样：API 按 Pod 名+namespace、checkpoint 按 PodUID——同名重建 Pod 的窗口期两者语义有差异，这是源码里明写的实现细节。
+- **"Index++ 的分配语义有什么坑？"** 多容器多资源时 multus 把 Pod 全部容器的设备聚合进同一个 map，按'排序后列表+附件顺序'取号——是**顺序约定，不和具体容器强绑定**；容器 A 的网络附件可能拿到容器 B 请求的设备号。单容器单资源无感，多容器多资源池要小心。
+- **"devinfo 文件（/var/run/k8s.cni.cncf.io/devinfo/）是 deviceID 来源吗？"** 不是——master 主链路里它是设备插件按 device-info-spec 写的辅助信息，multus 只在配置了 cniDeviceInfoPath 时把它复制到 runtime conf 目录（CopyDeviceInfoForCNIFromDP）供其他消费方用；**deviceID 的唯一来源就是 PodResources API / checkpoint**。可以主动讲这个认知修正："以为走 devinfo、读了源码才知道主链路是 PodResources API"——本身是加分信号。
+
+**sriov-cni ADD 处理过程逐句稿（把五步里的第 4 步展开到插件内部，1 分钟）：**
+
+> "multus 委托进来的 stdin 带 deviceID（VF 的 PCI 地址），sriov-cni 的 cmdAdd 分六步：**一，LoadConf**——校验 PCI 合法性，从 sysfs 反查 PF 名和 VFID；同时在 `/var/lib/cni/sriov` 对该 PCI 地址拿文件锁、查占用表，防旧 Pod 的 DEL 和新 Pod 的 ADD 对同一 VF 竞态；查 VF 的 host 网口名，查不到且绑了 DPDK 驱动就标记 DPDK 模式。**二，FillOriginalVfInfo**——把 VF 原始状态（admin MAC/VLAN/QoS/spoofchk/trust/限速/link state/MTU）读出来存进 netconf，这是 DEL 回滚的依据。**三，ApplyVFConfig**——在 PF 的 netlink 上按 VFID 下发 NAD 声明的属性：VLAN/QoS/proto、admin MAC、min/max 限速、spoofchk、trust、link_state。**四，SetupVF**——VF netdev 先搬进临时 netns、改名成 Pod 侧接口名（默认 net1）、清掉 altname，再搬进 Pod netns，设 effective MAC、开 arp_notify/ndisc_notify 和 optimistic DAD、UP。**五，IPAM**——`ipam.ExecAdd` 把整个配置委托给 whereabouts，拿回 IP 后在 Pod netns 里 ConfigureIface 配地址和路由。**六，收尾**——netconf 缓存到 `/var/lib/cni/sriov/<containerID>-<ifName>` 给 DEL 用，占用表登记 PCI 已分配，等 carrier（200ms 窗口）后主动发 GARP/Unsolicited NA——IP 是复用的，邻居缓存里可能还挂着上一个 Pod 的 MAC。"
+
+**sriov-cni DEL 处理（30 秒）：**
+
+> "cmdDel：从缓存读 netconf——读不到就静默成功，否则 kubelet 重试 DEL 会死循环；拿 PCI 锁；`ipam.ExecDel` 释放 IP；**ResetVFConfig 按缓存的原始状态逐项还原 PF 侧属性**；ReleaseVF 在 Pod netns 里 down、改回宿主机名、还原 effective MAC 和 MTU、搬回宿主机 netns；占用表摘除。两个边界值得主动讲：netns 已不存在（节点重启过）对 NSNotExist 静默放行，这是 CNI 规范要求；**ResetVFConfig 必须在 ReleaseVF 之前**——源码注释明说有的驱动在 trust off 状态下对已搬走的 VF 做 reset 会报错，所以先经 PF 还原属性、再搬接口。"
+
+**VF 预创建（前置条件，30 秒）：**
+
+> "VF 必须在插件启动前建好——vf-setup.md 原话 'requires SR-IOV VFs to be created on the host ahead of startup'，device plugin 只发现不创建。ConnectX 是两段式：**固件层** mlxconfig `SRIOV_EN=1 NUM_OF_VFS=N`（持久化，要重启）；**驱动层** `echo N > sriov_numvfs`（每次开机要重做）。RDMA 字符设备不用手动建——VF 被 mlx5_core 绑定后内核自动注册 ib 设备、生成 `/dev/infiniband/*`。插件对 VF 变化无感：ListAndWatch 的 Probe 未实现、设备列表静态，**改 VF 数量必须重启 sriovdp**。生产上这类主机配置交给 sriov-network-operator 或开机脚本。"
+
+**CNI 层追问预案（四连）：**
+
+- **"为什么 VF 属性在 PF 上配、不在 VF 口配？"** VLAN/spoofchk/trust/限速是 PF 的硬件资源属性，netlink 的 IFLA_VF_* 只能经 PF 下发，容器里根本看不到 PF——这正是 deviceID 被翻译成 (PF, VFID) 坐标的原因（呼应上一组追问①）。
+- **"cmdAdd 中途失败会留半配置吗？"** 不会——defer 钩子里接口已建成则 ReleaseVF、并无条件 ResetVFConfig，IPAM 失败同样 ExecDel 回滚；真正危险的窗口是 netconf 缓存写完之后进程崩，但那时 DEL 的输入还在缓存里，能走完整清理。
+- **"为什么先搬临时 netns 改名、不直接搬进 Pod netns？"** 改名（含清 altname）在临时 netns 里完成、成功才进 Pod netns——避免把还叫原名的接口塞进去后改名失败、把半状态留在 Pod netns；回滚路径也短，renameAndMoveLink 直接从临时 netns 搬回宿主。
+- **"MTU 谁定的？whereabouts 和 host-local 差别？"** MTU 继承 PF（ApplyVFConfig 从 pfLink 读），NAD 没有 MTU 字段，要改就改 PF；whereabouts 的分配记录在集群侧 IPPool CRD（带 Pod UID + TTL 回收孤儿 IP），多节点不冲突、Pod 重建拿回同 IP——host-local 是节点本地文件账本，跨节点必然冲突。
+
+**链路优化方式（RDMA 数据面，机制层面——只讲机制和代码依据，收益数字按全篇纪律不编）：**
+
+> "分四层说。**第一层，直通本身就是优化**：VF 独占直通，无 bridge、无 overlay，数据路径只有网卡本身；DPDK 场景再进一步走 vfio-pci 用户态收发包，是 kernel bypass 的另一条路（设备侧的体现就是 Allocate 里的 `/dev/vfio/*` DeviceSpec 和 PCIDEVICE 环境变量）；GPUDirect RDMA 让 NIC 与 GPU 直接 DMA，IOMMU/vfio 配置是 POC 项。**第二层，拓扑对齐**：device plugin 给每个 VF 上报 NUMA 节点（读 sysfs numa_node，`excludeTopology` 可关），Topology Manager 把 GPU/网卡/大页内存钉在同一 NUMA——RDMA 注册的 pinned memory 跨 NUMA 访问是必须避免的代价。**第三层，参数**：MTU 跟 PF（大帧少包数）；NCCL 的 RoCE 依赖交换机侧 PFC/ECN 无损底座（§5.1 已划给网络专项）；容器内 memlock/IPC_LOCK 是 pinned memory 注册的硬前提（rdma 文档原话）。**第四层，CNI 层把时间花在收敛上**：GARP/Unsolicited NA 把 IP 复用后的邻居收敛从'等 ARP 老化/超时'变成 UP 后主动立即通告；PCI 文件锁防 ADD/DEL 竞态是正确性优化；whereabouts 确定性分配让 Pod 重建拿回同 IP，减少上层重建。隔离边界再强调一次：共享模式下每 VF 独立 RDMA 设备实例是应用级隔离，netns 级 RDMA 隔离开源没有——这是 RdmaNic 隔离态的动机（§5.4）。"
+
+（来源：sriov-network-device-plugin / sriov-cni 两个本地仓库源码逐行（cni.go cmdAdd/cmdDel、sriov.go VF 状态机、pci_allocator、rdma.go、devices/api.go）+ **multus-cni master 源码（2026-10 经 GitHub API 逐行核对：k8sclient.go getKubernetesDelegate、kubeletclient.go、checkpoint.go、types conf.go addDeviceIDInConfList）** + sriovdp docs/vf-setup.md（VF 预创建原话）、docs/rdma/README.md（IPC_LOCK）、sriov-cni docs/configuration-reference.md（NAD 参数域）+ kubelet v0.36 deviceplugin API 类型 + sriov-cni `git log --grep rdma` 零命中；checkpoint 行为属 kubelet 通用机制，细节以部署版本源码为准；链路优化部分为机制层面共识 + 代码依据，无实测数字）
 
 ### 5.3 一期：开源插件先落地（30 秒）
 
@@ -218,7 +252,7 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 - [ ] §3 配额问题→方案一句话→两模块，能画前后对比
 - [ ] §4.1 两个死结 + §4.4"只读只写"金句背熟
 - [ ] §4.5 三个"为什么不上 XX"备好
-- [ ] §5.2 开源链路：五步口述 + Allocate 四字段 + deviceID 三作用 + VF 重启归属四连追问
+- [ ] §5.2 开源链路：五步口述 + Allocate 四字段 + deviceID 三作用 + VF 重启归属四连追问；multus 取号五步（注解前提/双后端降级/匹配键差异/Index++ 语义）+ multus 追问四连；sriov-cni ADD 逐句稿/DEL 两个边界 + VF 预创建两段式 + 链路优化四层 + CNI 层追问四连
 - [ ] §5.4 RdmaNic 同构论证三点
 - [ ] §6 主线收口脱稿
 - [ ] 诚信分层表（§0）开场主动讲——**分层定位本身就是加分项**
@@ -230,3 +264,4 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 2. eBPF 方案的挂载点顺序标注"内核源码已核对"，但具体内核版本（clsact 4.5 / LRU 4.10 / lpm 4.11 / ringbuf 5.8）是方案前提，未在目标环境逐台验证过——被问就说"方案里列了版本矩阵，实施前要 `uname -r` 逐项核对"。
 3. RDMA 分层：开源链路机制（§5.2）为源码研读结论、代码级可深钻，但未在集群实操验证；自研 RdmaNic 全部为设计——GPUDirect RDMA 的 IOMMU/vfio 配置验证是 POC 项，PD 分离（KV 传输依赖 RDMA）是二期 POC 前置项。kubelet device manager checkpoint / PodResources API 属 kubelet 通用机制（非本项目代码），细节以所部署 K8s 版本源码为准。
 4. 性能数字（eBPF vs iptables、缓存命中收益等）方案明确"不预设收益数字，以可复现实验为准"——面试同样不给数字，给验证方法。
+5. multus deviceID 机制结论核对自 multus-cni **master 分支**源码（2026-10，GitHub API 逐行读取 k8sclient.go / kubeletclient.go / checkpoint.go / conf.go）；所部署 multus 版本的确切行为（PodResources 支持的引入版本、匹配键细节、DRA 叠加是否存在）**未考证**——被问就讲 master 行为并注明核对方法：`multus --version` 对应 tag 的源码复核一遍。

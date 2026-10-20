@@ -48,7 +48,7 @@
 │                        │ 读 PodENI CR，等 Phase=Bind                   │
 │                        ▼                                              │
 │  数据面：  ENI(eth1) ──move──► Pod netns（直通，VPC IP）                │
-│            veth 对：host 端 ◄────► Pod 内 lira0（承载 Service 流量）    │
+│            veth 对：host 端 ◄────► Pod 内 veth1（承载 Service 流量）    │
 │            host：169.254.1.1 + /32 回程路由 + 永久 ARP                  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -65,7 +65,7 @@
 4. kubelet 起 sandbox → 调 **CNI ADD**（stdin 传 netconf，CNI_ARGS 传 Pod 名/namespace/infra container id）。
 5. 插件通过 **unix socket gRPC** 调 daemon 的 AllocIP；daemon 读 PodENI，**指数退避**等 Phase=Bind，返回 IP/MAC/PodCIDR/网关。
 6. 插件**按 MAC 反查主机上 ENI 的 ifindex**（Attach 是异步的，网卡已出现在主机上）→ `LinkSetNsFd` 把 ENI 移入 Pod netns → 改名 eth0 → 配 IP、默认路由（gw=VPC 网关）、PodCIDR 路由。
-7. 建 **veth 对**：Pod 侧 lira0 配同款 Pod IP + Service CIDR 路由 via 169.254.1.1（onlink）+ 对 169.254.1.1 的**永久 ARP**；host 侧 veth 配 169.254.1.1/32 + 回 Pod IP 的 /32 路由。
+7. 建 **veth 对**（Pod 侧接口名 **veth1**，host 侧 `lira`+pod名 hash）：veth1 **不配 IP**，纯 Service 导流口（代码里地址段被注释，passthrough_eni_linux.go:239）——配 169.254.1.1/32 scope link + Service CIDR via 169.254.1.1（onlink）+ 节点 IP/32 via 169.254.1.1，加对 169.254.1.1 的**永久 ARP**；host 侧配 169.254.1.1/32 + 回 Pod IP 的 /32 路由 + **PodIP→podVethMac 永久 ARP**（永久 ARP 两侧都写死；两侧 veth 的 MAC 都是插件 GenerateMac 自生成——"generate mac by self, do not wait veth mac ready"，所以表项内容在创建 veth 之前就确定）。
 8. 回写 Pod event（AllocIPSucceed + 耗时），输出 CNI Result 给 kubelet。
 
 > 讲的时候点出两个"为什么"：为什么按 MAC 找网卡（插件和 controller 解耦，唯一可靠关联键是 MAC）；为什么要 veth（见设计决策 4）。
@@ -89,7 +89,7 @@ DEL 链路（反向，30 秒）：
 - CHECK 实现了吗？→ 老实说早期版本是空实现（netns 配置静态校验价值有限），后续计划补链路级校验（IP 是否在、路由是否存在、veth 对端是否存活）。主动说反而加分。
 
 ### 2.2 数据面细节（体现"真做过"）
-- ★ **为什么 Pod 里要双接口（ENI + veth lira0）？** ENI 直通后 Pod 的默认路由走 VPC 网关，但 VPC 网关不认识 ClusterIP——访问 Service 的包出 ENI 就被丢。解法：Service CIDR 单独路由到 lira0 → 169.254.1.1（host veth）→ 交给 host 上的 kube-proxy（iptables/IPVS）做 Service 转换。VPC 流量走 ENI 保持高性能与原生 IP，Service 流量借道 host。这是 Calico（169.254.1.1 方案）/Terway 的成熟做法。
+- ★ **为什么 Pod 里要双接口（ENI + veth1）？** ENI 直通后 Pod 的默认路由走 VPC 网关，但 VPC 网关不认识 ClusterIP——访问 Service 的包出 ENI 就被丢。解法：Service CIDR 单独路由到 veth1 → 169.254.1.1（host veth）→ 交给 host 上的 kube-proxy（iptables/IPVS）做 Service 转换。VPC 流量走 ENI 保持高性能与原生 IP，Service 流量借道 host。这是 Calico（169.254.1.1 方案）/Terway 的成熟做法。（追问"veth1 配什么 IP"：**不配 IP**——Pod IP 唯一归属 eth0，两个接口配同 IP 会有 ARP 二义性；veth1 只做导流口。）
 - ★ **169.254.1.1 是什么？为什么要永久 ARP（NUD_PERMANENT）？** link-local 假网关，host veth 端配了这个地址。配永久静态 ARP 表项是为了避免每次发包都 ARP 广播等待解析——降低首包延迟，也避免某些场景 ARP 不通。Calico 同款。
 - **host 侧 169.254.1.1/32 和回程 /32 路由的作用？** host 上 veth 对端只需要一个锚点地址；/32 scope link 路由保证 host → Pod 的回包/探活流量能精准送达（不依赖子网广播域，直通网络里 Pod 不在 host 的 L2 里）。
 - **ENI 怎么"移"进 Pod netns？** `netlink LinkSetNsFd`，把主机 netns 的 fd 传给 setns 系统调用把网卡搬家；之后在 Pod netns 里 rename + up + 配地址路由。整个过程插件的 goroutine 需要锁定 OS 线程做 netns 切换（`runtime.LockOSThread` + containernetworking/plugins 的 ns 包）。

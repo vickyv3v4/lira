@@ -2,6 +2,7 @@
 
 > 策略：**面试不是 JD 符合度检查。赢法 = 两条真实流程讲透（主菜，占面试 80%）+ 其余话题各备 1-3 句弹药不穿底。**
 > 内容细节：interview-prep-mck.md / interview-prep-cni.md / interview-prep-mck-gpu.md（v1 骨架+红线+POC）+ **mck-gpu-platform-design.md（正式设计文档，GPU 话题的主内容源）** + mck-ai-platform-design.md（技术方案落地版：技术栈总表/部署拓扑/CRD 与配置样例/验收标准）。本文件只管"练什么、练到什么程度"。
+> **计时口述稿（主菜①②逐字版 + 快答表 + 节点池话术 + §8 经历型问答库）：面试话术-MCK与lira.md**
 
 ---
 

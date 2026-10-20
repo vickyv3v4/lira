@@ -62,6 +62,91 @@
 
 一期三个程序全部在宿主机 netns，pod 无法触碰（安全边界，§10）。
 
+### 3.3 数据流图（两模式）
+
+图 1：独占 ENI（挂载点 ①②③ 同 §3.2；四条主流程的逐步描述见 §5.2）
+
+```text
+                     VPC 网络 ═══════════════════════════════════════
+                       ▲     │                                  ▲
+              远端后端  │     │ 回包(dst=节点IP)                  │ 外部客户端
+              出站流量  │     ▼ ②                               │ NodePort入向 ▼②
+┌──────────────────────┴─────┴──────── 宿主机 netns ──────────────────────────┐
+│                                                                            │
+│  [节点主网卡 eth0]（节点IP，= SNAT 源）                                       │
+│     ├─② tc-ingress 回包还原入口：ct 反查 → src 还原 ClusterIP / dst 还原 pod1│
+│     │                 └→ redirect(lirayyyy host端) → pod1                   │
+│     │                 ct 未命中 → NodePort/ExternalIP 新连接：svc4 → DNAT+SNAT│
+│     │                   ├─ 本地后端 → redirect   ├─ 远端 → 交路由             │
+│     └─③ tc-egress host起源入口：host 发出的 ClusterIP 流量 DNAT（另挂 lo）     │
+│                                                                            │
+│  [lirayyyy host端]（请求 pod 宿主通信口；169.254.1.1/32 + 回 pod1 的 /32 路由）│
+│     └─① tc-ingress svc请求入口：ct → svc4 → backends 选后端 → DNAT+SNAT       │
+│            ├─ 后端在本节点 → bpf_redirect(liraxxxx host端)                   │
+│            └─ 后端在远节点 → TC_ACT_OK → 协议栈路由 → eth0 出 VPC              │
+│                                                                            │
+│  [liraxxxx host端]（后端 pod 宿主通信口，本地后端投递落点）                     │
+│                                                                            │
+│  注：容器 ENI 不在宿主机 netns —— 独占模式 ENI 已移进各 pod netns 当 eth0      │
+└───────┬───────────────────────────────────┬────────────────────────────────┘
+        │ veth（pod 侧 = veth1）             │ veth（pod 侧 = veth1）
+┌───────┴──────────┐           ┌────────────┴──────┐
+│ pod1 netns       │           │ pod2 netns        │
+│ [veth1] 宿主通信 │           │ [veth1] 宿主通信  │
+│   ServiceCIDR    │           │   ServiceCIDR     │
+│   路由→169.254.1.1│          │   路由→169.254.1.1│
+│ [eth0] = ENI 直通│           │ [eth0] = ENI 直通 │
+│   VPC 原生 IP    │           │   后端 IP         │
+│   默认路由→VPC网关│           │   默认路由→VPC网关│
+└──────────────────┘           └───────────────────┘
+```
+
+图 2：共享 ENI（仅列与图 1 的差异，①②③ 位置完全相同）
+
+```text
+                     VPC ═══════════════════════════════════════
+                       ▲    │                          ▲
+                       │    ▼ ②                        ▼ ②
+┌──────────────────────┴────┴──── 宿主机 netns ──────────────────────────────┐
+│  [节点主网卡 eth0] ②回包还原/NodePort入向   ③host起源（另挂 lo） —— 同图 1    │
+│                                                                           │
+│  [lirayyyy host端] ① svc请求入口（同图 1）   [liraxxxx host端] 本地投递      │
+│                                                                           │
+│  [ENI 主口] —— 共享模式 ENI 留在宿主机 netns（独占模式没有这个设备）           │
+│     ├─ pod 的 eth0 是它的 ipvlan 子口；出向包内核切到主口发出                 │
+│     │   （skb->dev = 主口; dev_queue_xmit，内核源码已核对，策略方案:42-45）   │
+│     └─ 二期源保持：主口 tc-ingress 内 ct 反查还原（无新程序）§5.3             │
+│                                                                           │
+│  注：同 ENI pod 互访走 ipvlan 二层直投、不进协议栈；但 svc 流量走 veth1，      │
+│      不经该路径，① 两模式通用                                               │
+└───────┬───────────────────────────────────┬────────────────────────────────┘
+        │ veth（pod 侧 = veth1）             │ veth（pod 侧 = veth1）
+┌───────┴──────────┐           ┌────────────┴──────┐
+│ pod1 netns       │           │ pod2 netns        │
+│ [veth1] 宿主通信 │           │ [veth1] 宿主通信  │
+│   ServiceCIDR    │           │   ServiceCIDR     │
+│   路由→169.254.1.1│          │   路由→169.254.1.1│
+│ [eth0] = ipvlan  │           │ [eth0] = ipvlan   │
+│   子口(secondary)│           │   子口（后端IP）   │
+│   默认路由→VPC网关│           │   默认路由→VPC网关│
+└──────────────────┘           └───────────────────┘
+```
+
+接口对照：
+
+| 设备 | 独占 ENI | 共享 ENI | SVC 挂载点 |
+| --- | --- | --- | --- |
+| 容器业务口 eth0 | 真 ENI（pod netns 内，VPC 原生 IP） | ipvlan 子口（secondary IP） | 一期不挂（二期独占模式在此挂还原程序，§5.3） |
+| 宿主通信口（pod 侧 veth1） | veth 对（ServiceCIDR→169.254.1.1） | 同左（结构相同） | ① 宿主端（lirayyyy）tc-ingress |
+| ENI 本体 | 在 pod netns（= 容器 eth0） | 宿主机 netns 的 ENI 主口 | 共享模式二期在主口入向挂还原 |
+| 节点主网卡 eth0 | ECS 主网卡，节点 IP（= SNAT 源） | 同左 | ② tc-ingress 还原/NodePort；③ tc-egress host起源（另挂 lo） |
+
+三行读图要点：
+
+- ① 在 pod 宿主 veth 而非容器 eth0：ServiceCIDR 路由指 veth1，svc 流量必经宿主机，两模式同构（§3.1）；
+- ② 在节点主网卡：一期 SNAT 源=节点 IP，回包必回主网卡，还原不触碰容器 ENI（§5.2-②）；
+- 两模式的本质差异只有一处：ENI 本体在 pod netns（独占）还是在宿主机 netns（共享）——一期 SNAT 语义下不生效，二期源保持才分叉（§5.3）。
+
 ## 4. 数据结构
 
 | Map | 类型 | Key → Value | 说明 |
@@ -231,3 +316,108 @@ UDP ct 超时秒级、LRU 面向高 churn 设计；容量按 QPS × 超时规划
 | 一期 | 三个程序 + SNAT 语义对齐 kube-proxy，逐节点灰度 | §9-4 验证清单全通过；单节点长期运行（含 Endpoint churn）无漂移 |
 | 二期 | 源保持（共享模式主口入向集成 / 独占模式 pod 内程序），与网络策略真实源判定打通 | 后端可见真实源；策略对 svc 流量按 pod 身份生效 |
 | 三期 | maglev、per-svc metrics、healthCheckNodePort 由 agent 提供 | LB 一致性测试；指标可视 |
+
+## 15. 附录：模块实现伪代码
+
+> 【伪代码，非可编译实现】表达各模块职责与数据流，API 以实现期选型为准（Go 侧 cilium/ebpf）。数据面程序每包执行，受 verifier 约束：无无界循环、仅 helper 白名单（§13-Q1）。
+
+### 15.1 控制面：svc agent（Go，lira-daemon 内）
+
+```go
+// 数据面只读 map，控制面只写 map。更新顺序与删除反序是本模块的核心契约（§5.1）。
+onServiceAddOrUpdate(svc):
+  backends := pickReadyBackends(svc)                 // EndpointSlice 就绪后端
+  revNatID := allocRevNatID(svc)
+  for i, be := range backends:                       // 先写后端，最后写前端
+    backendsMap.Update(key(svcID, i), be.IP, be.Port, revNatID)
+    revNatMap.Update(key(revNatID, backendTuple), frontTuple)
+  svc4Map.Update(key(svc.ClusterIP, port, proto), {svcID, 算法})   // 最后写前端
+  // NodePort：svc4Map.Update(key(0.0.0.0, nodePort, proto), {svcID, 算法})
+
+onServiceDelete(svc):
+  svc4Map.Delete(frontKey)                           // 先摘前端：新连接立即停
+  for be: backendsMap.Delete(); revNatMap.Delete()
+  ct.DeleteByBackend(svcID)                          // 联动清 ct：存量连接不黑洞（§6）
+
+onEndpointUpdate(svc):
+  rewriteBackendsSlots(svcID, readyList)             // Endpoint 变更只重写该 svc 槽位
+  ct.DeleteByBackend(removedBackends)
+
+resyncLoop():                                        // agent 重启后修复漂移（§5.1/§6）
+  diffAndFix(listWatchAll(), pinnedMaps)
+```
+
+### 15.2 数据面①：svc请求入口（lirayyyy tc-ingress，C）
+
+```c
+SEC("tc/ingress") int svc_ingress(skb) {
+  parse(eth/ip/l4); tuple = 五元组(skb);
+  // 1) 已有连接：ct 命中直接套用 NAT 结果（连接内后端一致性，§13-Q7）
+  ct = ct_lookup(tuple, CT_NEW);
+  if (ct && ct->nat_done) return ct_rewrite_redirect(skb, ct);  // 含回程反向还原
+  // 2) 新连接：查 svc 表（ClusterIP 用实 IP；NodePort 用 0.0.0.0，§4）
+  svc = svc4_lookup(dst_ip, dst_port, proto);
+  if (!svc) return TC_ACT_OK;                        // 非 svc 流量原样放行（§5.2-⑥）
+  be = select_backend(svc, flow);                    // 一期 random，三期 maglev
+  if (!be) return TC_ACT_OK;                         // 无后端 → 交协议栈得 refused（§5.2-⑥）
+  // 3) DNAT+SNAT：BPF 内自管端口池（snat map 记账，LRU 回收空闲端口，§13-Q6）
+  port = snat_alloc(节点IP, proto);
+  rewrite_l4(skb, dst=be.ip:be.port, src=节点IP:port);  // 连同校验和重算
+  ct_create(tuple, {be, rev_nat_id, 方向});
+  // 4) 本地后端直接投递；远端交宿主机路由（§5.2-①②）
+  if (be 在本节点) return bpf_redirect(ifindex(be.veth));
+  return TC_ACT_OK;
+}
+// 触发场景：pod 宿主 veth tc-ingress —— pod 发起的 svc 流量唯一入口（§3.3 图1-①）
+```
+
+### 15.3 数据面②：回包还原入口（eth0 tc-ingress，C）
+
+```c
+SEC("tc/ingress") int reply_restore(skb) {
+  parse;
+  // a) 回包场景：ct 反查命中 → 还原 → 送回请求 pod（§5.2-①）
+  ct = ct_lookup(reverse_tuple, CT_REPLY);
+  if (ct) {
+    rev_restore(skb, ct);           // src 还原 ClusterIP，dst 还原请求 pod
+    return bpf_redirect(ifindex(lirayyyy));
+  }
+  // b) ct 未命中 → NodePort/ExternalIP 新连接入口（§5.2-③）
+  svc = svc4_lookup(节点IP 或 0.0.0.0, dst_port, proto);
+  if (!svc) return TC_ACT_OK;                        // 继续进协议栈（节点自有流量）
+  同①：选后端 → DNAT+SNAT → 本地 redirect / 远端交路由
+  对应回程在本口命中 ct 后 bpf_redirect(eth0) 出站
+}
+// 触发场景：节点主网卡 tc-ingress —— 一期 SNAT 语义下所有回包统一回这里（§3.3 图1-②）
+```
+
+### 15.4 数据面③：host起源入口（eth0 tc-egress + lo，C）
+
+```c
+SEC("tc/egress") int host_origin(skb) {
+  parse;
+  if (ct_marked(tuple)) return TC_ACT_OK;            // ct 标记的包直接放行，防回环
+  svc = svc4_lookup(dst_ip, dst_port, proto);
+  if (!svc) return TC_ACT_OK;
+  同①：选后端 → DNAT+SNAT → 本地 redirect / 远端交路由；回包仍走②还原
+}
+// 触发场景：host 进程访问 ClusterIP（eth0-egress / lo 拦截，§3.2）
+```
+
+### 15.5 Go 侧加载/pin/attach/reconcile（通用骨架，【通用机制】）
+
+```go
+func setup() {
+  kernelCheck()                        // clsact 4.5 / LRU 4.10 / ringbuf 5.8 / BTF 5.2（§9-1）
+  coll := loadBpfObjects(embeddedELF)  // bpf2go 产物 embed 进二进制，单文件交付
+  for name, m := range coll.Maps { m.Pin("/sys/fs/bpf/lira/svc/" + name) }
+  attachTC(lirayyyy, INGRESS, coll.Progs["svc_ingress"])    // ①
+  attachTC(eth0,    INGRESS, coll.Progs["reply_restore"])   // ②
+  attachTC(eth0,    EGRESS,  coll.Progs["host_origin"])     // ③
+  attachTC("lo",    EGRESS,  coll.Progs["host_origin"])     // ③ 另挂 lo（§3.2）
+  go ringbufReader(coll.Maps["events"])                     // 丢弃计数 → 告警（§8）
+}
+func reconcileLoop() {   // 周期对照 pin 目录，缺失的 attach 重挂（§6）
+  reattachMissingPinnedProgs()
+}
+```
