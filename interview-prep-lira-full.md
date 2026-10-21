@@ -180,6 +180,10 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 - **"sriov-cni 没有 RDMA 代码，RDMA 的 netns 隔离怎么保证？"** 这是开源链路的明确边界：共享模式靠"每 VF 独立 RDMA 设备实例（mlx5_N）+ 设备节点直挂"保证应用级隔离；netns 级 RDMA 设备隔离（把 RDMA 设备 move 进 Pod netns）在社区 master 里没有，只有 fork/定制版本实现过——这正是自研 RdmaNic 隔离态的演进动机之一。
 - **"节点重启后，Pod 还能拿到上次的那个 VF 吗（vf1 会不会变 vf2）？"** 分两层：**硬件层**——VF 的唯一身份是 PCI 地址，固件决定 VF 枚举顺序，同机重启后 VF k 还是那个地址（前提：硬件/插槽/BIOS 不变）；**记账层**——"谁用哪个 VF"记在 kubelet device manager 的 checkpoint（/var/lib/kubelet/device-plugins/kubelet_checkpoint），节点重启后 Pod 重建走 Allocate 时同 podUID 直接复用记录的 deviceID，不重新挑。**会换 VF 的场景**：Pod 删了重建（新 UID 重挑）、checkpoint 丢失、换卡/换插槽/BIOS 变更导致 PCI 枚举变化、Pod 换节点。整条链路对"VF 换了"是容忍的：RDMA 设备名（mlx5_N）和 uverbs 编号重启后本就可能漂移，device plugin 每次分配从 sysfs 现查映射（rdmamap）、multus 每次 ADD 现查 PodResources——稳定锚点始终是 PCI 地址，IP 由 whereabouts 按记录归还。
 
+**为什么这条链路必须有 multus（架构必然性——先答 Why 再答 How，1 分钟）：**
+
+> "反证最清楚：把 sriov-cni 的配置文件直接放进 /etc/cni/net.d 行不行？机制上确实会被调用——这就是配置文件的事——但有三道墙。**一，目录语义是'Pod 的默认网络'，没有选择粒度**：所有 Pod 共用同一份（kubelet 语义：字典序第一个文件生效），排在集群 CNI 后面就永远是死文件；排前面或写进 conflist 链就所有 Pod 都走 SR-IOV，没人注解的普通 Pod 也得吃 VF——VF 是稀缺资源，一张 CX-6 也就百来个。**二，文件是静态的，deviceID 是每 Pod 的（致命墙）**：sriov-cni LoadConf 里 deviceID 为空直接报 'VF pci addr is required'——'这个 Pod 分到哪个 VF'只有 kubelet device manager 知道，静态文件写不出来；写死一个 PCI 地址则第二个 Pod 撞 PCI 文件锁 'pci address is already allocated' 起不来。**三，缺的从来不是'调用'而是 ADD 时刻的 per-Pod 动态组装**——读注解、解析 NAD、查 PodResources 拿本 Pod 的 deviceID、注入 delegate 再转发，这个组件就是 multus。所以 sriov-cni 在 multus 方案里恰恰没有 net.d 配置文件：二进制在 /opt/cni/bin、运行配置来自 NAD，被 multus delegate；kubelet/运行时从头到尾只认识默认 CNI multus 自己（00-multus.conflist）。精确表述（加分项）：CNI 的调用方是运行时（containerd/CRI-O 的 CRI 插件），kubelet 经 CRI 委托——'kubelet 调 CNI'是 docker-shim 时代的说法。"
+
 **multus 拿 deviceID 的完整过程（multus master 源码逐行核对过，1 分钟）：**
 
 > "先把结论立住：**deviceID 不是从 multus 配置文件读的，是 CNI ADD 时实时查 kubelet 的资源分配账本**。五步：**一，触发前提**——NAD 必须带 `k8s.v1.cni.cncf.io/resourceName` 注解，没有它 multus 压根不查资源、deviceID 为空，sriov-cni 直接报 'VF pci addr is required'——手写 NAD 忘带注解是运维第一坑。**二，取 Pod 身份**——用 CNI_ARGS 里的 Pod 名/namespace 去 API Server 拿完整 Pod 对象（含 UID）。**三，惰性建 resourceMap**——遇到第一个带注解的 NAD 才建：首选 dial `/var/lib/kubelet/pod-resources/kubelet.sock` 调 PodResources API 的 ListPodResources，拿 kubelet device manager 维护的'Pod→容器→资源名→设备ID'全量快照；**socket 文件不存在就降级**直接读 checkpoint 文件 `/var/lib/kubelet/device-plugins/kubelet_internal_checkpoint`。**四，匹配聚合**——API 路径按 Pod 名+namespace 匹配、checkpoint 路径按 PodUID 匹配，把该 Pod 所有容器的设备按资源名聚合、排序，得到 `{资源名: [PCI地址列表]}`。**五，按序取号注入**——用注解里的资源名查 map，取 `DeviceIDs[Index]` 后 Index++（同 Pod 挂多个同资源 NAD 依次分配），`addDeviceIDInConfList` 把 `"deviceID": "0000:xx"` 写进委托配置的每个 plugin JSON——sriov-cni 的 stdin 里就有了。"
@@ -210,11 +214,19 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 - **"为什么先搬临时 netns 改名、不直接搬进 Pod netns？"** 改名（含清 altname）在临时 netns 里完成、成功才进 Pod netns——避免把还叫原名的接口塞进去后改名失败、把半状态留在 Pod netns；回滚路径也短，renameAndMoveLink 直接从临时 netns 搬回宿主。
 - **"MTU 谁定的？whereabouts 和 host-local 差别？"** MTU 继承 PF（ApplyVFConfig 从 pfLink 读），NAD 没有 MTU 字段，要改就改 PF；whereabouts 的分配记录在集群侧 IPPool CRD（带 Pod UID + TTL 回收孤儿 IP），多节点不冲突、Pod 重建拿回同 IP——host-local 是节点本地文件账本，跨节点必然冲突。
 
+**Pod 迁移/驱逐时 VF 与 RDMA 发生什么（生命周期收尾题，1 分钟）：**
+
+> "先定调：K8s 里 Pod 没有迁移语义，迁移=删除重建（KubeVirt 虚机热迁移是另一档）。**删除侧是一次完整的 VF 归还**：CmdDel 从缓存恢复 netconf（读不到静默成功，防 DEL 重试风暴）→ `ipam.ExecDel` 释放 IP 回 whereabouts 池 → **ResetVFConfig 先经 PF 逐项还原属性、ReleaseVF 再把 VF netdev 搬回宿主 netns、恢复原始接口名和 MAC**（这个顺序不能反，见上一组 DEL 边界）→ 释放 PCI 文件锁，VF 重新可分配。其余两层不需要谁显式做：device plugin 的列表静态无'释放'事件，Pod 死设备自动回池；/dev/infiniband 是宿主设备 mount 进容器的，随容器销毁，进程死则 QP/CQ/PD 和注册的 pinned memory 由内核 refcount 自动清理，宿主无残留。运维坑：kubelet 宕机导致 CmdDel 没跑（缓存丢失走静默路径），netns 销毁时内核会把 VF 网卡自动搬回宿主 netns（改名兜底）——VF 不丢，但接口名/MAC 可能漂移，靠下次分配时重设 MAC 兜底。**重建侧身份全换**：VF PCI 地址大概率变（kubelet 按可用池重挑）、IP 由 whereabouts 重分、**GID 必变（GUID per VF，VF 换 GID 就换）、QPN 必变（QP 状态在进程 uverbs 上下文里，人死 QP 死）**——RDMA 连接必断，NCCL 重新 bootstrap、重建全部对端 QP，训练靠 checkpoint 恢复；sriov-cni 发的 GARP/Unsolicited NA 只刷新 ARP/ND 邻居缓存，救得了寻址救不了 QP。所以 GPU 训练平台标配 checkpoint + gang scheduling——迁移等于中断，恢复靠重启不靠接续。**热迁移是另一档**：直通 VF 的 QP/DMA 状态在硬件里，没有 hypervisor 虚拟化层可拦截序列化（与 virtio 状态在软件里本质相反），传统上不可行；NVIDIA migratable VF（ConnectX-6 Dx 起的固件/驱动特性）可把 QP 状态随迁移传递，但应用层 rdma_cm 连接仍需重建；实践妥协是'先拔后插'——迁移前热解绑 VF、VM 带降级网卡飞、落地再挂新 VF，连接反正要断。"
+
 **链路优化方式（RDMA 数据面，机制层面——只讲机制和代码依据，收益数字按全篇纪律不编）：**
 
 > "分四层说。**第一层，直通本身就是优化**：VF 独占直通，无 bridge、无 overlay，数据路径只有网卡本身；DPDK 场景再进一步走 vfio-pci 用户态收发包，是 kernel bypass 的另一条路（设备侧的体现就是 Allocate 里的 `/dev/vfio/*` DeviceSpec 和 PCIDEVICE 环境变量）；GPUDirect RDMA 让 NIC 与 GPU 直接 DMA，IOMMU/vfio 配置是 POC 项。**第二层，拓扑对齐**：device plugin 给每个 VF 上报 NUMA 节点（读 sysfs numa_node，`excludeTopology` 可关），Topology Manager 把 GPU/网卡/大页内存钉在同一 NUMA——RDMA 注册的 pinned memory 跨 NUMA 访问是必须避免的代价。**第三层，参数**：MTU 跟 PF（大帧少包数）；NCCL 的 RoCE 依赖交换机侧 PFC/ECN 无损底座（§5.1 已划给网络专项）；容器内 memlock/IPC_LOCK 是 pinned memory 注册的硬前提（rdma 文档原话）。**第四层，CNI 层把时间花在收敛上**：GARP/Unsolicited NA 把 IP 复用后的邻居收敛从'等 ARP 老化/超时'变成 UP 后主动立即通告；PCI 文件锁防 ADD/DEL 竞态是正确性优化；whereabouts 确定性分配让 Pod 重建拿回同 IP，减少上层重建。隔离边界再强调一次：共享模式下每 VF 独立 RDMA 设备实例是应用级隔离，netns 级 RDMA 隔离开源没有——这是 RdmaNic 隔离态的动机（§5.4）。"
 
-（来源：sriov-network-device-plugin / sriov-cni 两个本地仓库源码逐行（cni.go cmdAdd/cmdDel、sriov.go VF 状态机、pci_allocator、rdma.go、devices/api.go）+ **multus-cni master 源码（2026-10 经 GitHub API 逐行核对：k8sclient.go getKubernetesDelegate、kubeletclient.go、checkpoint.go、types conf.go addDeviceIDInConfList）** + sriovdp docs/vf-setup.md（VF 预创建原话）、docs/rdma/README.md（IPC_LOCK）、sriov-cni docs/configuration-reference.md（NAD 参数域）+ kubelet v0.36 deviceplugin API 类型 + sriov-cni `git log --grep rdma` 零命中；checkpoint 行为属 kubelet 通用机制，细节以部署版本源码为准；链路优化部分为机制层面共识 + 代码依据，无实测数字）
+**IB 模式的变化（对比 RoCE——"IB 和 RoCE 走这条链路有什么不同"必问，1 分钟）：**
+
+> "链路骨架不变，变化集中三处。**一，插件侧多两个 IB 专属选择器**：`linkTypes: ["infiniband"]` 区分同一节点的 RoCE 口（ether）和 IB 口——ConnectX 一块卡两种模式由固件链路层（LINK_TYPE_P）决定，选择器就是干这个的；`pKeys`（Partition Key，IB 世界里 VLAN 的对位物）——但 README 明确**只匹配设备默认 index0 的 PKey、只兼容 linkTypes=infiniband**，即插件对 pKey 只做选择不做配置，pKey 归 Subnet Manager/fabric 侧规划。**二，寻址模型反转（上一问'IP 承重还是标志'在 IB 上反转）**：RoCEv2 的 GID 从 netdev IP 派生、rdma_cm 走路由表选口；原生 IB 的 GID 来自端口 GUID（固件出厂）、LID 由 SM 分配、rdma_cm 向 SA 查 PathRecord——**IP 完全不参与 RDMA 寻址，退化为 IPoIB 通道的附属物**，'IP 只是识别标志'在原生 IB 上才成立。**三，sriov-cni 对 IB 零特判**（仓库 grep infiniband/ipoib/pkey 零命中）——VF 搬 netns/UP/IPAM 委托照常工作，但 NAD 的 vlan/mac/spoofchk/trust 是 Ethernet 语义，IB 下会失败或被驱动忽略，**IB 的 NAD 必须收掉这些参数**；IPoIB 口链路层地址是 20 字节不是 6 字节 MAC；MTU 继承 PF 的逻辑不变但语义是 IB Path MTU（上限 4KB 量级，与以太网 jumbo 不是一个体系）。**不变的部分**：isRdma→/dev/infiniband DeviceSpecs 挂载、multus 取号注入、whereabouts 分 IP 全照旧；fabric 侧多一个 SM 组件（交换机内置或 OpenSM），在 K8s 视野之外。"
+
+（来源：sriov-network-device-plugin / sriov-cni 两个本地仓库源码逐行（cni.go cmdAdd/cmdDel、sriov.go VF 状态机、pci_allocator、rdma.go、devices/api.go、config.go LoadConf——'VF pci addr is required' 与 PCI 锁 'already allocated' 原话）+ **multus-cni master 源码（2026-10 经 GitHub API 逐行核对：k8sclient.go getKubernetesDelegate、kubeletclient.go、checkpoint.go、types conf.go addDeviceIDInConfList）** + sriovdp docs/vf-setup.md（VF 预创建原话）、docs/rdma/README.md（IPC_LOCK）、sriovdp README linkTypes/pKeys 示例与说明 + pkg/types/types.go、pkg/factory/factory.go（IB 选择器注册）、sriov-cni docs/configuration-reference.md（NAD 参数域）+ kubelet v0.36 deviceplugin API 类型 + sriov-cni `git log --grep rdma` 零命中、`grep infiniband/ipoib/pkey` 零命中（IB 零特判）；checkpoint 行为属 kubelet 通用机制，细节以部署版本源码为准；链路优化/迁移/IB 部分为机制层面共识 + 代码依据，无实测数字）
 
 ### 5.3 一期：开源插件先落地（30 秒）
 
@@ -252,7 +264,7 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 - [ ] §3 配额问题→方案一句话→两模块，能画前后对比
 - [ ] §4.1 两个死结 + §4.4"只读只写"金句背熟
 - [ ] §4.5 三个"为什么不上 XX"备好
-- [ ] §5.2 开源链路：五步口述 + Allocate 四字段 + deviceID 三作用 + VF 重启归属四连追问；multus 取号五步（注解前提/双后端降级/匹配键差异/Index++ 语义）+ multus 追问四连；sriov-cni ADD 逐句稿/DEL 两个边界 + VF 预创建两段式 + 链路优化四层 + CNI 层追问四连
+- [ ] §5.2 开源链路：五步口述 + Allocate 四字段 + deviceID 三作用 + VF 重启归属四连追问；multus 必然性三道墙 + 取号五步（注解前提/双后端降级/匹配键差异/Index++ 语义）+ multus 追问四连；sriov-cni ADD 逐句稿/DEL 两个边界 + VF 预创建两段式 + Pod 迁移归还链与身份表 + 链路优化四层 + CNI 层追问四连 + IB 对比三处变化
 - [ ] §5.4 RdmaNic 同构论证三点
 - [ ] §6 主线收口脱稿
 - [ ] 诚信分层表（§0）开场主动讲——**分层定位本身就是加分项**
@@ -265,3 +277,4 @@ iptables vs eBPF 四点（备查）：看得到流量（iptables 看不到 ipvla
 3. RDMA 分层：开源链路机制（§5.2）为源码研读结论、代码级可深钻，但未在集群实操验证；自研 RdmaNic 全部为设计——GPUDirect RDMA 的 IOMMU/vfio 配置验证是 POC 项，PD 分离（KV 传输依赖 RDMA）是二期 POC 前置项。kubelet device manager checkpoint / PodResources API 属 kubelet 通用机制（非本项目代码），细节以所部署 K8s 版本源码为准。
 4. 性能数字（eBPF vs iptables、缓存命中收益等）方案明确"不预设收益数字，以可复现实验为准"——面试同样不给数字，给验证方法。
 5. multus deviceID 机制结论核对自 multus-cni **master 分支**源码（2026-10，GitHub API 逐行读取 k8sclient.go / kubeletclient.go / checkpoint.go / conf.go）；所部署 multus 版本的确切行为（PodResources 支持的引入版本、匹配键细节、DRA 叠加是否存在）**未考证**——被问就讲 master 行为并注明核对方法：`multus --version` 对应 tag 的源码复核一遍。
+6. Pod 迁移一节：CmdDel 归还链、PCI 锁、ResetVFConfig 先于 ReleaseVF 为 sriov-cni 源码结论；"netns 销毁时内核自动把 VF 网卡搬回宿主 netns（改名兜底）"为 Linux 通用行为，未逐版本验证；KubeVirt 热迁移、NVIDIA migratable VF（ConnectX-6 Dx 起的固件特性）为公开资料机制层面叙述——未实测、固件/驱动要求未逐项核对，被问就说"方向确定、细节需按目标硬件核实"。IB 对比：sriov-cni 零命中为源码 grep 结论；pKeys 仅匹配 index0、只兼容 infiniband 出自 sriovdp README 原话；SM/SA/PathRecord、IPoIB 20 字节硬件地址为 IBTA 通用机制。multus 必然性一节：'VF pci addr is required' 与 'already allocated' 为 config.go 原话；"kubelet 语义：字典序第一份文件生效"为 kubelet（docker-shim 时代）文档化行为，containerd 时代运行时实现细节未逐项核对。
