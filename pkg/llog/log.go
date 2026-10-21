@@ -1,6 +1,10 @@
 package llog
 
-import "github.com/sirupsen/logrus"
+import (
+	"os"
+
+	"github.com/sirupsen/logrus"
+)
 
 var Logger *logrus.Logger
 
@@ -11,4 +15,16 @@ func init() {
 
 func SetLevel(level logrus.Level) {
 	Logger.SetLevel(level)
+}
+
+var LoggerCni *logrus.Logger
+
+func NewLoggerForCNI() *logrus.Logger {
+
+	log := logrus.New()
+	log.SetOutput(os.Stderr)
+	log.SetReportCaller(true)
+
+	LoggerCni = log
+	return LoggerCni
 }

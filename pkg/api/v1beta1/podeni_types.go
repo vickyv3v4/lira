@@ -27,9 +27,14 @@ import (
 type PodENISpec struct {
 	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-
-	ENI    VPCENI `json:"eni"`
-	NodeIP string `json:"nodeIP,omitempty"`
+	PodIPInfo   PodIP  `json:"podIPInfo"`
+	ENI         VPCENI `json:"eni"`
+	NodeIP      string `json:"nodeIP,omitempty"`
+	ServiceCidr string `json:"serviceCidr,omitempty"`
+}
+type PodIP struct {
+	IPAddress string `json:"ipAddress"`
+	SubnetID  string `json:"subnetID"`
 }
 type VPCENI struct {
 	ID             string   `json:"id,omitempty"`
@@ -45,6 +50,43 @@ type VPCENI struct {
 
 type PhaseStr string
 
+// podeni exclusive mode     |    podeni multieniip mode
+// pod create                |    pod create
+//
+//	                         |
+//		|                    |        |
+//		| podENI create      |        | podENI create
+//		|                    |        |
+//	                         |
+//
+// ENIPhaseInitial           |    ENIPhaseInitial
+//
+//	                         |
+//		|                    |        |
+//		| allocate eni       |        |  allocate eni secondary ip
+//		|                    |        |
+//	                         |
+//
+// ENIPhaseCreated           |    ENIPhaseIPAllocated
+//
+//		                     |
+//		|   	             |        |
+//		|       	         |        |  podeni delete
+//		|   bind eni 	     |        |
+//		                     |
+//	                         |
+//
+// ENIPhaseBind              |    ENIPhaseDeleting
+//
+//	|                        |         |
+//	|  podEni delete         |         |  release eni secondary ip
+//	|                        |         |
+//
+// ENIPhaseDeleting          |    del podENI
+//
+//	| eni delete
+//
+// del podENI
 const (
 	// ENIPhaseInitial the status when pod first created, eni has been created
 	ENIPhaseInitial = ""
@@ -54,6 +96,8 @@ const (
 	ENIPhaseBind = "Bind"
 	// ENIPhaseDeleting the status when CR is removing
 	ENIPhaseDeleting = "Deleting"
+	// ENIPhaseIPAllocated when secondary ip allocated
+	ENIPhaseIPAllocated = "Allocated"
 )
 
 // PodENIStatus defines the observed state of PodENI
@@ -64,14 +108,16 @@ type PodENIStatus struct {
 	ECSID    string   `json:"ecsId,omitempty"`
 	WorkLoad string   `json:"workLoad,omitempty"`
 	NodeName string   `json:"nodeName,omitempty"`
+	ENIID    string   `json:"eniID,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:storageversion
-// +kubebuilder:printcolumn:name="ENIID",type="string",JSONPath=".spec.eni.id"
+// +kubebuilder:printcolumn:name="ENIID",type="string",JSONPath=".status.eniID"
 // +kubebuilder:printcolumn:name="Node",type="string",JSONPath=".status.nodeName"
 // +kubebuilder:printcolumn:name="ENIIP",type="string",JSONPath=".spec.eni.ipAddress"
+// +kubebuilder:printcolumn:name="PodIP",type="string",JSONPath=".spec.podIPInfo.ipAddress"
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase"
 // PodENI is the Schema for the podenis API
 type PodENI struct {

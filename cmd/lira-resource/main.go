@@ -2,14 +2,11 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"os"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	k8sErr "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -20,6 +17,7 @@ import (
 
 	networkv1beta1 "gitlab.msxf.com/mscloud/lira/pkg/api/v1beta1"
 	"gitlab.msxf.com/mscloud/lira/pkg/controllers"
+	"gitlab.msxf.com/mscloud/lira/pkg/msxf"
 	"gitlab.msxf.com/mscloud/lira/pkg/types"
 	"gitlab.msxf.com/mscloud/lira/pkg/utils"
 )
@@ -42,6 +40,11 @@ func main() {
 	flag.BoolVar(&utils.GConfig.EnableLeaderElection, "leader-elect", true,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
+	var runMode string
+	flag.StringVar(&runMode, "run-mode", string(utils.MultiENIIP), "lira ip allocate mode")
+	utils.GConfig.RunMode = utils.LiraIPMode(runMode)
+	flag.StringVar(&utils.GConfig.OpenAPIUrl, "open-api-url", "", "The url for msxf openapi.")
+
 	opts := zap.Options{
 		Development: true,
 	}
@@ -57,7 +60,7 @@ func main() {
 		Scheme:                 scheme,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "913c3772.msxf.com",
+		LeaderElectionID:       "913c3773x.msxf.com",
 		MetricsBindAddress:     metricsAddr,
 	})
 	if err != nil {
@@ -83,20 +86,11 @@ func main() {
 		os.Exit(1)
 	}
 	ctrlCtx := &controllers.ControllerCtx{
-		Context:  ctx,
-		MsConfig: msconfig,
+		Context:    ctx,
+		MsConfig:   msconfig,
+		MsxfClient: msxf.NewMsxfClient(utils.GConfig.OpenAPIUrl),
 	}
-	// watch node
-	go func() {
-		for {
-			err = updateNodeENIResource(ctx, msconfig)
-			if err != nil {
-				setupLog.Error(err, "update node eni resource failed.")
-				time.Sleep(5 * time.Second)
-			}
-			time.Sleep(1 * time.Second)
-		}
-	}()
+
 	for name := range controllers.Resources {
 		err = controllers.Resources[name].Creator(mgr, ctrlCtx)
 		if err != nil {
@@ -136,79 +130,4 @@ func getMsconfig(ctx context.Context) (*controllers.MSConfig, error) {
 	}
 	setupLog.Info("get ms config")
 	return msConfig, nil
-}
-
-func updateNodeENIResource(ctx context.Context, msconfig *controllers.MSConfig) error {
-	setupLog.Info("start updateNodeENIResource ")
-	restConfig := ctrl.GetConfigOrDie()
-
-	c, err := client.New(restConfig, client.Options{
-		Scheme: types.Scheme,
-	})
-	if err != nil {
-		return err
-	}
-	nodeList := &corev1.NodeList{}
-	err = c.List(ctx, nodeList)
-	if err != nil {
-		setupLog.Error(err, "list node failed")
-		return err
-	}
-	for _, node := range nodeList.Items {
-		setupLog.Info("get node", "name", node.Name)
-		nodeCopy := node.DeepCopy()
-
-		eniNums := "0"
-
-		if utils.IsMasterNode(nodeCopy) {
-			eniNums = msconfig.MasterENINum
-		} else {
-			//如果 types.ENI_COUNTS 存在于 nodeCopy.Labels 中，则 eniCountsErr 为 nil 或 false，表示操作成功
-			eniCounts, eniCountsErr := nodeCopy.Labels[types.ENI_COUNTS]
-			setupLog.Info("printeniCounts ", "printeniCounts", eniCounts)
-			setupLog.Info("printeniCounts ", "eniCountsErr", eniCountsErr)
-			if !eniCountsErr {
-				msg := "node label eni_counts is missing or empty"
-				labelMissingErr := errors.New(msg)
-				setupLog.Error(labelMissingErr, "label is not exist")
-				return labelMissingErr
-			}
-			eniNums = eniCounts
-
-		}
-		_, e := nodeCopy.Status.Capacity[corev1.ResourceName(types.ENIResourceKey)]
-		if !e {
-			setupLog.Info("start patch node", "name", node.Name)
-			// master 和 work节点区分，只变更work节点
-			nodeCopy.Status.Allocatable[corev1.ResourceName(types.ENIResourceKey)] = resource.MustParse(eniNums)
-			nodeCopy.Status.Capacity[corev1.ResourceName(types.ENIResourceKey)] = resource.MustParse(eniNums)
-
-			err := patchNodeCr(ctx, nodeCopy, &node, c)
-			if err != nil {
-				setupLog.Error(err, "update node cr failed.")
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func patchNodeCr(ctx context.Context, nodeCopy *corev1.Node, node *corev1.Node, c client.Client) error {
-	var err error
-	retry := 5
-	patchObj := client.MergeFrom(node)
-	for i := 0; i < retry; i++ {
-		setupLog.Info("patch node", "node name", node.Name)
-		err = c.Status().Patch(ctx, nodeCopy, patchObj)
-		if err != nil {
-			setupLog.Error(err, "patch node failed", "node name", node.Name)
-			if i < retry {
-				continue
-			}
-			return err
-		}
-		return nil
-	}
-	setupLog.Error(err, "max retries reached, update node failed")
-	return err
 }

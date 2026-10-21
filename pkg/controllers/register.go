@@ -10,7 +10,7 @@ import (
 
 type ControllerCtx struct {
 	context.Context
-	MsxfClient       *msxf.MsxfClient
+	MsxfClient       msxf.MsxfClientAPI
 	RegisterResource []client.Object
 	MsConfig         *MSConfig
 	PodENICurrent    int

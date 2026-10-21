@@ -33,4 +33,5 @@ type LinkConfig struct {
 	GatewayIP    string
 	Mac          string
 	HostIP       string
+	TmpPodIfName string
 }

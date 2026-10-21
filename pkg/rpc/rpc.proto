@@ -42,6 +42,7 @@ message BasicInfo {
   string MAC = 4;
   IPSet GatewayIP = 5;
   string NodeIP = 6;
+  IPSet ParentENIIP = 7;
 }
 
 message ReleaseIPRequest {

@@ -1,9 +1,10 @@
 
 # Image URL to use all building/pushing image targets
-RESOURCE_IMG ?= lira-resource:v0.1.3
-CONTROLLER_IMG ?= lira-controller:v0.1.3
-DAEMON_IMG ?= lira-daemon:v0.1.3
-INIT_IMG ?= lira-init-cni:v0.1.3
+TAG ?= multi-eniip
+RESOURCE_IMG ?= lira-resource:${TAG}
+CONTROLLER_IMG ?= lira-controller:${TAG}
+DAEMON_IMG ?= lira-daemon:${TAG}
+INIT_IMG ?= lira-init-cni:${TAG}
 
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION = 1.23

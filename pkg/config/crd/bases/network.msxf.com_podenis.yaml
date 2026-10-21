@@ -15,7 +15,7 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
-    - jsonPath: .spec.eni.id
+    - jsonPath: .status.eniID
       name: ENIID
       type: string
     - jsonPath: .status.nodeName
@@ -23,6 +23,9 @@ spec:
       type: string
     - jsonPath: .spec.eni.ipAddress
       name: ENIIP
+      type: string
+    - jsonPath: .spec.podIPInfo.ipAddress
+      name: PodIP
       type: string
     - jsonPath: .status.phase
       name: Phase
@@ -77,13 +80,31 @@ spec:
                 type: object
               nodeIP:
                 type: string
+              podIPInfo:
+                description: |-
+                  INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
+                  Important: Run "make" to regenerate code after modifying this file
+                properties:
+                  ipAddress:
+                    type: string
+                  subnetID:
+                    type: string
+                required:
+                - ipAddress
+                - subnetID
+                type: object
+              serviceCidr:
+                type: string
             required:
             - eni
+            - podIPInfo
             type: object
           status:
             description: PodENIStatus defines the observed state of PodENI
             properties:
               ecsId:
+                type: string
+              eniID:
                 type: string
               nodeName:
                 type: string

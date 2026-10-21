@@ -3,9 +3,12 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
-	"gitlab.msxf.com/mscloud/lira/pkg/types"
+	"math/rand"
 	"strconv"
 	"strings"
+	"time"
+
+	"gitlab.msxf.com/mscloud/lira/pkg/types"
 
 	"github.com/google/uuid"
 	corev1 "k8s.io/api/core/v1"
@@ -33,10 +36,32 @@ func PodSandboxExited(p *corev1.Pod) bool {
 		return false
 	}
 }
+
 func GenerateENIName(ecsId string) string {
 	return fmt.Sprintf("mck-%s-eni", ecsId)
 }
 
+func GeneratePodNodeENIName(ecsId string) string {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 4)
+	for i := range b {
+		b[i] = letters[r.Intn(len(letters))]
+	}
+	str := ecsId + string(b)
+	return fmt.Sprintf("mck-%s-eni", str)
+}
+
+func GenerateENIGrUniqueID(ecsId string) string {
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = letters[r.Intn(len(letters))]
+	}
+	str := ecsId + string(b)
+	return fmt.Sprintf("mck-%s", str)
+}
 func IsValidNumber(s string) (bool, int) {
 	// 移除字符串中的逗号
 	s = strings.Replace(s, ",", "", -1)
@@ -62,4 +87,31 @@ func IsMasterNode(node *corev1.Node) bool {
 		return true
 	}
 	return false
+}
+
+func DiffStringSlice(a, b []string) []string {
+	var diff []string
+	if len(a) <= len(b) {
+		setA := make(map[string]struct{}, len(a))
+		for _, s := range a {
+			setA[s] = struct{}{}
+		}
+		for _, s := range b {
+			if _, exists := setA[s]; !exists {
+				diff = append(diff, s)
+			}
+		}
+
+	} else if len(a) >= len(b) {
+		setB := make(map[string]struct{}, len(b))
+		for _, s := range b {
+			setB[s] = struct{}{}
+		}
+		for _, s := range a {
+			if _, exists := setB[s]; !exists {
+				diff = append(diff, s)
+			}
+		}
+	}
+	return diff
 }

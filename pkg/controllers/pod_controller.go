@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,14 +87,14 @@ type ReconcilePod struct {
 
 	//record event recorder
 	record     record.EventRecorder
-	msxfClient *msxf.MsxfClient
+	msxfClient msxf.MsxfClientAPI
 	log        *logrus.Logger
 	MSconfig   *MSConfig
 	nodeMutex  sync.Mutex
 }
 
 // NewReconcilePod watch pod lifecycle events and sync to podENI resource
-func NewReconcilePod(mgr manager.Manager, msxfClient *msxf.MsxfClient, log *logrus.Logger, msconf *MSConfig) *ReconcilePod {
+func NewReconcilePod(mgr manager.Manager, msxfClient msxf.MsxfClientAPI, log *logrus.Logger, msconf *MSConfig) *ReconcilePod {
 	r := &ReconcilePod{
 		client:     mgr.GetClient(),
 		scheme:     mgr.GetScheme(),
@@ -165,6 +166,25 @@ func (r *ReconcilePod) UpdateNodeENIResource(ctx context.Context, node *corev1.N
 	}
 	return nil
 }
+
+func (r *ReconcilePod) podCreateMultiEniIP(ctx context.Context, podCopy *corev1.Pod, podENICopy *v1beta1.PodENI) error {
+	podNode := &v1beta1.PodNode{}
+
+	err := r.client.Get(ctx, k8stypes.NamespacedName{
+		Name: podCopy.Spec.NodeName,
+	}, podNode)
+	if err != nil {
+		if k8sErr.IsNotFound(err) {
+			r.log.Infof("podnode %s is not found.", podNode.Name)
+			return fmt.Errorf("podnode is not found")
+		}
+		return err
+	}
+
+	podENICopy.Status.ENIID = podNode.Status.NetworkInterfaces[0].ID
+	return nil
+}
+
 func (r *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcile.Result, error) {
 	node, err := r.getNode(ctx, pod.Spec.NodeName)
 	if err != nil {
@@ -225,10 +245,8 @@ func (r *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcil
 			},
 		},
 		Spec: v1beta1.PodENISpec{
-			NodeIP: nodeIP,
-			ENI: v1beta1.VPCENI{
-				ServiceCidr: r.MSconfig.ServiceCidr,
-			},
+			NodeIP:      nodeIP,
+			ServiceCidr: r.MSconfig.ServiceCidr,
 		},
 	}
 
@@ -239,6 +257,18 @@ func (r *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcil
 		return reconcile.Result{}, err
 	}
 	podENICopy := podENI.DeepCopy()
+	// multi-ip mode
+	if utils.GConfig.RunMode == utils.MultiENIIP {
+		err := r.podCreateMultiEniIP(ctx, pod.DeepCopy(), podENICopy)
+		if err != nil {
+			if strings.Contains(err.Error(), "podnode is not found") {
+				return reconcile.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			r.log.WithError(err).Error("create multi-ip podeni cr status failed.")
+			return reconcile.Result{}, err
+		}
+	}
+
 	podENICopy.Status.NodeName = pod.Spec.NodeName
 	podENICopy.Status.ECSID = ecsID
 	err = r.client.Status().Update(ctx, podENICopy)
@@ -247,13 +277,7 @@ func (r *ReconcilePod) podCreate(ctx context.Context, pod *corev1.Pod) (reconcil
 		return reconcile.Result{}, err
 	}
 	r.log.Info("has patched podeni cr status")
-	/*
-		err = r.updateNodeENIResource(ctx, node)
-		if err != nil {
-			r.log.WithError(err).Error("update node cr failed.")
-			return reconcile.Result{}, err
-		}
-	*/
+
 	defer func() {
 		if err != nil {
 			r.log.WithError(err).Error("error happend,podCreate ")
@@ -308,8 +332,8 @@ func (r *ReconcilePod) DeleteENI(ctx context.Context, podEni *v1beta1.PodENI) er
 		},
 	}
 	nctx := xcontext.MockContext(ctx, data)
-	nctx = context.WithValue(nctx, xcontext.PropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
-	nctx = context.WithValue(nctx, xcontext.PropagationType, xcontext.PortalPlatform)
+	nctx = context.WithValue(nctx, PlatformPropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
+	nctx = context.WithValue(nctx, CtxPropagationType, PPortalPlatform)
 	err := r.msxfClient.DeleteENI(nctx, &msxf.DeleteNetworkInterfaceRequest{
 		ID:             podEni.Spec.ENI.ID,
 		TenantID:       r.MSconfig.TenantID,

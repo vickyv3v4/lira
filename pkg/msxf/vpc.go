@@ -39,7 +39,7 @@ func AttachNetworkInterface(ctx context.Context, apiHost string, request *Attach
 		Data:        request,
 		Result:      &result,
 	})
-	log.Infof("AttachNetworkInterface req body: %+v , res: %+v, eni: %s", request, response, request.ID)
+	log.Infof("AttachNetworkInterface req body: %+v , res: %+v, eni: %s, %+v", request, response, request.ID, ctx)
 	if response.Error != nil {
 		log.Errorf("AttachNetworkInterface, 调用vpc接口异常: %s", response.Error.Error())
 		err = response.Error
@@ -307,5 +307,85 @@ func DescribeNetworkInterface(ctx context.Context, apiHost string, request *Desc
 		return
 	}
 	eni = &result.Data
+	return
+}
+
+type FixedIPList struct {
+	IPAddress string `json:"ipAddress"`
+	SubnetID  string `json:"subnetID"`
+}
+
+type HandleENISecondaryIPRequest struct {
+	ID        string        `json:"id"`
+	FixedIPs  []FixedIPList `json:"fixedIPs"`
+	AzoneCode int           `json:"azoneCode"`
+}
+
+type SecondaryIPsInfo struct {
+	ID                    string                `json:"id"`
+	OSID                  string                `json:"osID"`
+	Name                  string                `json:"name"`
+	Description           string                `json:"description"`
+	TenantID              string                `json:"tenantID"`
+	RegionCode            int                   `json:"regionCode"`
+	RegionName            string                `json:"regionName"`
+	AzoneCode             int                   `json:"azoneCode"`
+	AzoneName             string                `json:"azoneName"`
+	IPAddress             string                `json:"ipAddress"`
+	MacAddress            string                `json:"macAddress"`
+	NetworkID             string                `json:"networkID"`
+	SubnetID              string                `json:"subnetID"`
+	Status                string                `json:"status"`
+	ServerID              string                `json:"serverID"`
+	Type                  int                   `json:"type"`
+	TargetID              string                `json:"targetID"`
+	TargetType            string                `json:"targetType"`
+	SecondaryPrivateIPs   []SecondaryPrivateIPs `json:"secondaryPrivateIPs"`
+	CreatedAt             string                `json:"createdAt"`
+	UpdatedAt             string                `json:"updatedAt"`
+	Subnet                SubnetInfo            `json:"subnet"`
+	OwnerType             string                `json:"ownerType"`
+	IngressBandwidthLimit int                   `json:"ingressBandwidthLimit"`
+	EgressBandwidthLimit  int                   `json:"egressBandwidthLimit"`
+}
+type SubnetInfo struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Cidr      string `json:"cidr"`
+	GatewayIP string `json:"gatewayIP"`
+}
+type SecondaryPrivateIPs struct {
+	IPAddress string `json:"ipAddress"`
+	SubnetID  string `json:"subnetID"`
+}
+type HandleENISecondaryIPResponse struct {
+	xhttp.Rsp
+	Data SecondaryIPsInfo `json:"data"`
+}
+
+func HandleMultiENISecondaryIP(ctx context.Context, apiHost string, request *HandleENISecondaryIPRequest) (ipsInfo *SecondaryIPsInfo, err error) {
+	log := llog.Logger
+
+	result := new(HandleENISecondaryIPResponse)
+	response := xhttpclient.Post(ctx, &xhttp.Request{
+		Url:         fmt.Sprintf("%s/portal/vpc-service/web/v1/network-interface/%s/secondary-private-ip", apiHost, request.ID),
+		ContentType: xhttp.JSON,
+		Context:     ctx,
+		Data:        request,
+		Result:      &result,
+		Timeout:     time.Duration(600) * time.Second,
+	})
+	log.Infof("HandleENISecondaryIPRequest req body: %+v , res: %+v ,ctx: %+v", request, response, ctx)
+	if response.Error != nil {
+		log.Errorf("HandleENISecondaryIP, 调用vpc接口异常: %s", response.Error.Error())
+		err = response.Error
+		return
+	}
+	if result.Code != 0 {
+		log.Errorf("HandleENISecondaryIP, %+v 调用vpc接口响应异常: %s", request, result.Msg)
+		err = xerrors.NewCustomError(result.Code, result.Msg)
+		return
+	}
+	ipsInfo = &result.Data
 	return
 }

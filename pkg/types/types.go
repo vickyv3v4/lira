@@ -18,6 +18,7 @@ const (
 	AnnotationsENIECSID    = AnnotationPrefix + "ecsId"
 	AnnotationsENINUMS     = AnnotationPrefix + "eniNums"
 	FinalizerPodENI        = "mck.msxf.com/pod-eni"
+	FinalizerPodNode       = "mck.msxf.com/pod-node"
 
 	LabelRoleControl = "node-role.kubernetes.io/control-plane"
 	LabelRoleMaster  = "node-role.kubernetes.io/master"
@@ -110,4 +111,5 @@ type K8SArgs struct {
 // CNIConf is the cni network config
 type CNIConf struct {
 	cniTypes.NetConf
+	RunMode string `json:"runMode,omitempty"`
 }

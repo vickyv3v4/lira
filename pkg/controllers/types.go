@@ -12,6 +12,14 @@ const (
 	ErrorInsufficientENINUM = "error Node has binded enough ENIs"
 )
 
+const MaxAllocatableEniNums int = 9
+
+const (
+	CtxPropagationType     = "ctx-type"
+	PPortalPlatform        = "portal"
+	PlatformPropagationKey = "platform-ctx"
+)
+
 type MSConfig struct {
 	TenantID        string   `json:"tenantId"`
 	CloudAccountID  string   `json:"cloudAccountId"`

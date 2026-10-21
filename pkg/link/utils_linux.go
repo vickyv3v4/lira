@@ -213,6 +213,19 @@ func VethNameForPod(name, namespace, ifName, prefix string) (string, error) {
 	}
 	return fmt.Sprintf("%s%s", prefix, hex.EncodeToString(h.Sum(nil))[:11]), nil
 }
+
+func IPVlanTmpNameForPod(name, namespace, prefix string) (string, error) {
+	// A SHA1 is always 20 bytes long, and so is sufficient for generating the
+	// veth name and mac addr.
+	h := sha1.New()
+
+	_, err := h.Write([]byte(namespace + "." + name))
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s%s", prefix, hex.EncodeToString(h.Sum(nil))[:5]), nil
+}
+
 func DeleteVeth(hostVethName string) error {
 	log := llog.Logger
 

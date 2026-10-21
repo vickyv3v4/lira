@@ -38,6 +38,15 @@ func (rs *rpcService) AllocIP(ctx context.Context, r *rpc.AllocIPRequest) (*rpc.
 	var podENI *networkv1beta1.PodENI
 	var innerErr error
 
+	var readyPhase networkv1beta1.PhaseStr
+
+	switch utils.GConfig.RunMode {
+	case utils.ExclusiveENI:
+		readyPhase = networkv1beta1.ENIPhaseBind
+	case utils.MultiENIIP:
+		readyPhase = networkv1beta1.ENIPhaseIPAllocated
+	}
+
 	err := wait.ExponentialBackoffWithContext(ctx, wait.Backoff{
 		Duration: time.Second * 10,
 		Factor:   2,
@@ -51,7 +60,7 @@ func (rs *rpcService) AllocIP(ctx context.Context, r *rpc.AllocIPRequest) (*rpc.
 			if !podENI.DeletionTimestamp.IsZero() {
 				return false, errors.New("podENI is deleting")
 			}
-			if podENI.Status.Phase != networkv1beta1.ENIPhaseBind {
+			if podENI.Status.Phase != readyPhase {
 				return false, nil
 			}
 			return true, nil
@@ -68,7 +77,7 @@ func (rs *rpcService) AllocIP(ctx context.Context, r *rpc.AllocIPRequest) (*rpc.
 		BasicInfo: &rpc.BasicInfo{
 			MAC: podENI.Spec.ENI.MACAddress,
 			PodIP: &rpc.IPSet{
-				IPv4: podENI.Spec.ENI.IPAddress,
+				IPv4: podENI.Spec.PodIPInfo.IPAddress,
 			},
 			PodCIDR: &rpc.IPSet{
 				IPv4: podENI.Spec.ENI.PodCidr,
@@ -77,7 +86,7 @@ func (rs *rpcService) AllocIP(ctx context.Context, r *rpc.AllocIPRequest) (*rpc.
 				IPv4: podENI.Spec.ENI.GatewayIP,
 			},
 			ServiceCIDR: &rpc.IPSet{
-				IPv4: podENI.Spec.ENI.ServiceCidr,
+				IPv4: podENI.Spec.ServiceCidr,
 			},
 			NodeIP: podENI.Spec.NodeIP,
 		},

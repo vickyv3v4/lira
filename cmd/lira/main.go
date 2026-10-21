@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -20,9 +21,11 @@ import (
 )
 
 const (
-	defaultCniTimeout   = 120 * time.Second
-	defaultEventTimeout = 10 * time.Second
-	defaultVethPrefix   = "lira"
+	defaultCniTimeout       = 120 * time.Second
+	defaultEventTimeout     = 10 * time.Second
+	defaultVethPrefix       = "lira"
+	defaultIPVlanPrefix     = "ipvlan"
+	defaultIPVlanHostPrefix = "ipvl_"
 )
 
 func init() {
@@ -43,7 +46,7 @@ type AllocIPResult struct {
 }
 
 func cmdAdd(args *skel.CmdArgs) error {
-	log := llog.Logger
+	log := llog.NewLoggerForCNI()
 	log.Info("cmd add pod ip")
 	cmdArgs, err := cni.GetCmdArgs(args)
 	if err != nil {
@@ -92,12 +95,18 @@ func cmdAdd(args *skel.CmdArgs) error {
 	serviceRoute := cniTypes.Route{
 		Dst: *s,
 	}
-	hostVethName, err := link.VethNameForPod(string(k8sConfig.K8S_POD_NAME), string(k8sConfig.K8S_POD_NAMESPACE), link.DefaultVethForENI, defaultVethPrefix)
+
+	hostVethName, err := link.VethNameForPod(string(k8sConfig.K8S_POD_NAME), string(k8sConfig.K8S_POD_NAMESPACE), cmdArgs.InputArgs.IfName, defaultVethPrefix)
 	if err != nil {
 		log.Error(err, "generate veth name.")
 		return err
 	}
-	log.Infof("hostVethName: %s", hostVethName)
+	ipVlanTmpName, err := link.IPVlanTmpNameForPod(string(k8sConfig.K8S_POD_NAME), string(k8sConfig.K8S_POD_NAMESPACE), defaultIPVlanPrefix)
+	if err != nil {
+		log.Error(err, "generate ipvlan name.")
+		return err
+	}
+	log.Infof("hostipvlanName: %s", hostVethName)
 	config := &link.LinkConfig{
 		ENIIndex:     index,
 		HostVethName: hostVethName,
@@ -108,11 +117,24 @@ func cmdAdd(args *skel.CmdArgs) error {
 		GatewayIP:    replyRes.GatewayIP,
 		Mac:          replyRes.Mac,
 		HostIP:       replyRes.NodeIP,
+		TmpPodIfName: ipVlanTmpName,
 	}
-	err = link.NewExclusiveENIDriver().Install(ctx, config, cmdArgs.NetNS)
-	if err != nil {
-		log.Error(err, "failed to setup ExclusiveENIDriver")
-		return err
+	mode := cniConf.RunMode
+	switch utils.LiraIPMode(mode) {
+	case utils.MultiENIIP:
+		err = link.NewMultiIPvlanENIDriver().Install(ctx, config, cmdArgs.NetNS)
+		if err != nil {
+			log.Error(err, "failed to setup MultiIPvlanENIDriver")
+			return err
+		}
+	case utils.ExclusiveENI:
+		err = link.NewExclusiveENIDriver().Install(ctx, config, cmdArgs.NetNS)
+		if err != nil {
+			log.Error(err, "failed to setup ExclusiveENIDriver")
+			return err
+		}
+	default:
+		return errors.New("cni ip mode is invalid")
 	}
 
 	err = link.EnsureHostNsConfig()
@@ -134,6 +156,7 @@ func cmdAdd(args *skel.CmdArgs) error {
 	})
 	return cniTypes.PrintResult(result, cniConf.CNIVersion)
 }
+
 func doRPCAdd(ctx context.Context, client rpc.LiraBackendClient, cmdArgs *cni.CniCmdArgs) (res *AllocIPResult, err error) {
 	log := llog.Logger
 	var k8sConfig, args = cmdArgs.K8sArgs, cmdArgs.InputArgs
@@ -214,7 +237,7 @@ func cmdCheck(args *skel.CmdArgs) error {
 }
 
 func cmdDel(args *skel.CmdArgs) error {
-	log := llog.Logger
+	log := llog.NewLoggerForCNI()
 	log.Info("cmd release pod ip")
 	cmdArgs, err := cni.GetCmdArgs(args)
 	if err != nil {
@@ -240,27 +263,37 @@ func cmdDel(args *skel.CmdArgs) error {
 
 func doCmdDel(ctx context.Context, cmdArgs *cni.CniCmdArgs) error {
 	log := llog.Logger
-	var cniNetns, k8sConf = cmdArgs.NetNS, cmdArgs.K8sArgs
+	var cniNetns, k8sConf, cniConf = cmdArgs.NetNS, cmdArgs.K8sArgs, cmdArgs.Conf
 	ip, err := link.GetLinkAddrByName(cmdArgs.InputArgs.IfName)
 	if err != nil {
 		log.Error(err, "error GetLinkAddrByName")
 		return err
 	}
-	err = link.GenericCleanup(ctx, cniNetns)
-	if err != nil {
-		log.Error(err, "error GenericCleanup")
-		return err
-	}
+
 	hostVethName, err := link.VethNameForPod(string(k8sConf.K8S_POD_NAME), string(k8sConf.K8S_POD_NAMESPACE), cmdArgs.InputArgs.IfName, defaultVethPrefix)
 	if err != nil {
 		log.Error(err, "generate veth name.")
 		return err
 	}
 	log.Infof("hostVethName: %s", hostVethName)
-	err = link.DeleteVethRoute(hostVethName, ip)
-	if err != nil {
-		log.Error(err, "delete veth route.")
-		return err
+
+	runMode := cniConf.RunMode
+	switch utils.LiraIPMode(runMode) {
+	case utils.ExclusiveENI:
+		err = link.GenericCleanup(ctx, cniNetns)
+		if err != nil {
+			log.Error(err, "error GenericCleanup")
+			return err
+		}
+
+		err = link.DeleteVethRoute(hostVethName, ip)
+		if err != nil {
+			log.Error(err, "delete veth route.")
+			return err
+		}
+	case utils.MultiENIIP:
+	default:
+		return errors.New("cni ip mode is invalid")
 	}
 	err = link.DeleteVethNeigh(hostVethName, ip)
 	if err != nil {

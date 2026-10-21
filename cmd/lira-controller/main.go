@@ -65,6 +65,9 @@ func main() {
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.StringVar(&utils.GConfig.OpenAPIUrl, "open-api-url", "", "The url for msxf openapi.")
 	flag.IntVar(&utils.GConfig.PodENICurrent, "podeni-current", 1, "The podeni controller's maximum number of concurrent Reconciles")
+	var runMode string
+	flag.StringVar(&runMode, "run-mode", string(utils.MultiENIIP), "lira ip allocate mode")
+	utils.GConfig.RunMode = utils.LiraIPMode(runMode)
 	opts := zap.Options{
 		Development: true,
 	}

@@ -33,10 +33,12 @@ import (
 	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -71,9 +73,13 @@ func (w *PodENIWrapper) Start(ctx context.Context) error {
 func init() {
 	Add(podENIControllerName, func(mgr manager.Manager, ctrlCtx *ControllerCtx) error {
 		ctrlCtx.RegisterResource = append(ctrlCtx.RegisterResource, &v1beta1.PodENI{})
-		c, err := controller.NewUnmanaged(controllerName, mgr, controller.Options{
+		c, err := controller.NewUnmanaged(podENIControllerName, mgr, controller.Options{
 			Reconciler:              NewReconcilePodENI(mgr, llog.Logger, ctrlCtx.MsxfClient, ctrlCtx.MsConfig),
 			MaxConcurrentReconciles: ctrlCtx.PodENICurrent,
+			RateLimiter: workqueue.NewItemExponentialFailureRateLimiter(
+				2*time.Second,
+				5*time.Minute,
+			),
 		})
 		if err != nil {
 			return err
@@ -91,11 +97,47 @@ func init() {
 			source.Kind(mgr.GetCache(), &v1beta1.PodENI{}),
 			&handler.EnqueueRequestForObject{},
 			&predicate.ResourceVersionChangedPredicate{},
+			&predicateForPodENIEvent{},
 		)
 	}, true)
 }
 
-func NewReconcilePodENI(mgr manager.Manager, log *logrus.Logger, msxfClient *msxf.MsxfClient, msconf *MSConfig) *PodENIReconciler {
+type predicateForPodENIEvent struct {
+	predicate.Funcs
+}
+
+func (p *predicateForPodENIEvent) Create(e event.CreateEvent) bool {
+	return processPodENI(e.Object)
+}
+
+func (p *predicateForPodENIEvent) Update(e event.UpdateEvent) bool {
+	return processPodENI(e.ObjectNew)
+}
+
+func (p *predicateForPodENIEvent) Delete(e event.DeleteEvent) bool {
+	return processPodENI(e.Object)
+}
+
+func (p *predicateForPodENIEvent) Generic(e event.GenericEvent) bool {
+	return processPodENI(e.Object)
+}
+
+func processPodENI(o client.Object) bool {
+	podEni, ok := o.(*v1beta1.PodENI)
+	if !ok {
+		return false
+	}
+
+	if podEni.Status.NodeName == "" {
+		return false
+	}
+	if podEni.Status.ENIID == "" {
+		return false
+	}
+	return true
+}
+
+func NewReconcilePodENI(mgr manager.Manager, log *logrus.Logger, msxfClient msxf.MsxfClientAPI, msconf *MSConfig) *PodENIReconciler {
 	return &PodENIReconciler{
 		client:     mgr.GetClient(),
 		scheme:     mgr.GetScheme(),
@@ -119,7 +161,7 @@ type PodENIReconciler struct {
 	scheme     *runtime.Scheme
 	log        *logrus.Logger
 	record     record.EventRecorder
-	msxfClient *msxf.MsxfClient
+	msxfClient msxf.MsxfClientAPI
 	MSconfig   *MSConfig
 	nodeMutex  sync.Mutex
 }
@@ -153,7 +195,7 @@ func (r *PodENIReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if !controllerutil.ContainsFinalizer(podENI, types.FinalizerPodENI) {
 			return reconcile.Result{}, nil
 		}
-		result, err := r.podENIDelete(ctx, podENI, start)
+		result, err := r.podENIDelete(ctx, podENI)
 		r.recordPodENIDeleteErr(podENI, start, err)
 		return result, err
 	}
@@ -223,7 +265,7 @@ func (r *PodENIReconciler) checkNodeENIConfig(ctx context.Context, node *corev1.
 
 	if totalNum <= 0 {
 		r.log.Errorf("Node %s %s num is  %d", node.Name, corev1.ResourceName(types.ENIResourceKey), totalNum)
-		return fmt.Errorf("Node %s %s num is  %d", node.Name, corev1.ResourceName(types.ENIResourceKey), totalNum)
+		return fmt.Errorf("node %s %s num is  %d", node.Name, corev1.ResourceName(types.ENIResourceKey), totalNum)
 	}
 	r.log.Infof("node %s eni allocat %d, eni total %d", node.Name, eniCnt, totalNum)
 	if eniCnt >= totalNum {
@@ -369,8 +411,8 @@ func (r *PodENIReconciler) deleteENI(ctx context.Context, podEni *v1beta1.PodENI
 		},
 	}
 	nctx := xcontext.MockContext(ctx, data)
-	nctx = context.WithValue(nctx, xcontext.PropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
-	nctx = context.WithValue(nctx, xcontext.PropagationType, xcontext.PortalPlatform)
+	nctx = context.WithValue(nctx, PlatformPropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
+	nctx = context.WithValue(nctx, CtxPropagationType, PPortalPlatform)
 	err := r.msxfClient.DeleteENI(nctx, &msxf.DeleteNetworkInterfaceRequest{
 		ID:             podEni.Spec.ENI.ID,
 		TenantID:       r.MSconfig.TenantID,
@@ -382,6 +424,7 @@ func (r *PodENIReconciler) deleteENI(ctx context.Context, podEni *v1beta1.PodENI
 	}
 	return nil
 }
+
 func (r *PodENIReconciler) checkPodIsExist(ctx context.Context, n k8stypes.NamespacedName) (bool, error) {
 	pod := &corev1.Pod{}
 	err := r.client.Get(ctx, n, pod)
@@ -403,9 +446,120 @@ func (r *PodENIReconciler) checkPodIsExist(ctx context.Context, n k8stypes.Names
 		return true, nil
 	}
 }
-func (r *PodENIReconciler) podENICreate(ctx context.Context, _ client.ObjectKey, podENI *v1beta1.PodENI, startTime time.Time) (result reconcile.Result, err error) {
-	r.log.Infof("podENI %s creating, phase %s", podENI.Name, podENI.Status.Phase)
 
+func (r *PodENIReconciler) podENIattachENI(ctx context.Context, podENICopy *v1beta1.PodENI) error {
+
+	reuqestId := utils.GenerateRequestId()
+	data := &xcontext.CloudPlatform{
+		Type: xcontext.PortalPlatform,
+		Portal: &xcontext.Portal{
+			RequestID:      reuqestId,
+			CloudAccountID: r.MSconfig.CloudAccountID,
+			TenantID:       r.MSconfig.TenantID,
+		},
+	}
+	nctx := xcontext.MockContext(ctx, data)
+	nctx = context.WithValue(nctx, PlatformPropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, reuqestId))
+	nctx = context.WithValue(nctx, CtxPropagationType, PPortalPlatform)
+	ecsId, ok := podENICopy.Labels[types.AnnotationsENIECSID]
+	if !ok {
+		r.log.Error(fmt.Sprintf("podeni %s ecsId label is null", podENICopy.Name))
+		return fmt.Errorf("podeni %s ecsId label is null", podENICopy.Name)
+	}
+	isNumberic, azCode := utils.IsValidNumber(r.MSconfig.AzoneCode)
+	if !isNumberic {
+		r.log.Errorf("%s is not a vaild number", r.MSconfig.AzoneCode)
+		return fmt.Errorf("azcode %s is not a vaild number", r.MSconfig.AzoneCode)
+	}
+	err := r.msxfClient.AttachENI(nctx, &msxf.AttachNetworkInterfaceRequest{
+		ID:             podENICopy.Spec.ENI.ID,
+		AZoneCode:      azCode,
+		TenantID:       r.MSconfig.TenantID,
+		ServerID:       ecsId,
+		RequestId:      reuqestId,
+		CloudAccountID: r.MSconfig.CloudAccountID,
+	})
+	if err != nil {
+		r.log.WithError(err).Error("attch eni failed.")
+		return err
+	}
+	return nil
+}
+
+func (r *PodENIReconciler) podENIDetachENI(ctx context.Context, podENI *v1beta1.PodENI, startTime time.Time) error {
+
+	requestId := utils.GenerateRequestId()
+	data := &xcontext.CloudPlatform{
+		Type: xcontext.PortalPlatform,
+		Portal: &xcontext.Portal{
+			RequestID:      requestId,
+			CloudAccountID: r.MSconfig.CloudAccountID,
+			TenantID:       r.MSconfig.TenantID,
+		},
+	}
+	nctx := xcontext.MockContext(ctx, data)
+	nctx = context.WithValue(nctx, PlatformPropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
+	nctx = context.WithValue(nctx, CtxPropagationType, PPortalPlatform)
+	err := r.msxfClient.DetachENI(nctx, &msxf.DetachNetworkInterfaceRequest{
+		ID:             podENI.Spec.ENI.ID,
+		TenantID:       r.MSconfig.TenantID,
+		RequestId:      requestId,
+		CloudAccountID: r.MSconfig.CloudAccountID,
+	})
+	if err != nil {
+		r.recordPodENIDettachErr(podENI, startTime, err)
+		r.log.WithError(err).Error("podENI dettach eni failed.")
+	}
+	return err
+}
+
+func (r *PodENIReconciler) podENIAllocateENI(ctx context.Context, podENICopy *v1beta1.PodENI, startTime time.Time) (*msxf.ENI, error) {
+
+	requestId := utils.GenerateRequestId()
+	data := &xcontext.CloudPlatform{
+		Type: xcontext.PortalPlatform,
+		Portal: &xcontext.Portal{
+			RequestID:      requestId,
+			CloudAccountID: r.MSconfig.CloudAccountID,
+			TenantID:       r.MSconfig.TenantID,
+		},
+	}
+	nctx := xcontext.MockContext(ctx, data)
+	nctx = context.WithValue(nctx, PlatformPropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
+	nctx = context.WithValue(nctx, CtxPropagationType, PPortalPlatform)
+
+	name := utils.GenerateENIName(podENICopy.Status.ECSID)
+
+	isNumberic, azCode := utils.IsValidNumber(r.MSconfig.AzoneCode)
+	if !isNumberic {
+		r.log.Errorf("%s is not a vaild number", r.MSconfig.AzoneCode)
+		return nil, fmt.Errorf("azcode %s is not a vaild number", r.MSconfig.AzoneCode)
+	}
+	eni, err := r.msxfClient.AllocateENI(nctx, &msxf.CreateNetworkInterfaceRequest{
+		Name:            name,
+		Description:     fmt.Sprintf("Created by MCK %s VPC CNI", r.MSconfig.ClusterID),
+		TenantID:        r.MSconfig.TenantID,
+		RegionCode:      cast.ToInt(r.MSconfig.RegionCode),
+		AZoneCode:       azCode,
+		NetworkID:       r.MSconfig.VPCID,
+		SubnetID:        r.MSconfig.SubnetID,
+		SecurityGroups:  r.MSconfig.SecurityGroups,
+		OwnerType:       r.MSconfig.OwnerType,
+		CloudAccountID:  r.MSconfig.CloudAccountID,
+		ResourceGroupID: r.MSconfig.ResourceGroupID,
+		RequestId:       requestId,
+		GrUniqueID:      podENICopy.Name,
+		Type:            2,
+	})
+	if err != nil {
+		r.recordPodENICreateErr(podENICopy, startTime, err)
+		r.log.WithError(err).Error("create eni failed.")
+		return nil, err
+	}
+	return eni, nil
+}
+
+func (r *PodENIReconciler) podENICreateExcusive(ctx context.Context, podENI *v1beta1.PodENI, startTime time.Time) (result reconcile.Result, err error) {
 	var exist bool
 	switch podENI.Status.Phase {
 	case v1beta1.ENIPhaseBind:
@@ -468,66 +622,15 @@ func (r *PodENIReconciler) podENICreate(ctx context.Context, _ client.ObjectKey,
 		defer func() {
 			if err != nil {
 				r.recordPodENIAttachErr(podENI, startTime, err)
-				requestId := utils.GenerateRequestId()
-				data := &xcontext.CloudPlatform{
-					Type: xcontext.PortalPlatform,
-					Portal: &xcontext.Portal{
-						RequestID:      requestId,
-						CloudAccountID: r.MSconfig.CloudAccountID,
-						TenantID:       r.MSconfig.TenantID,
-					},
-				}
-				nctx := xcontext.MockContext(ctx, data)
-				nctx = context.WithValue(nctx, xcontext.PropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
-				nctx = context.WithValue(nctx, xcontext.PropagationType, xcontext.PortalPlatform)
-				err = r.msxfClient.DetachENI(nctx, &msxf.DetachNetworkInterfaceRequest{
-					ID:             podENI.Spec.ENI.ID,
-					TenantID:       r.MSconfig.TenantID,
-					RequestId:      requestId,
-					CloudAccountID: r.MSconfig.CloudAccountID,
-				})
-				if err != nil {
-					r.recordPodENIDettachErr(podENI, startTime, err)
-					r.log.WithError(err).Error("podENI dettach eni failed.")
-				}
+				r.podENIDetachENI(ctx, podENI, startTime)
 			}
 		}()
 
 		podENICopy := podENI.DeepCopy()
-
-		reuqestId := utils.GenerateRequestId()
-		data := &xcontext.CloudPlatform{
-			Type: xcontext.PortalPlatform,
-			Portal: &xcontext.Portal{
-				RequestID:      reuqestId,
-				CloudAccountID: r.MSconfig.CloudAccountID,
-				TenantID:       r.MSconfig.TenantID,
-			},
-		}
-		nctx := xcontext.MockContext(ctx, data)
-		nctx = context.WithValue(nctx, xcontext.PropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, reuqestId))
-		nctx = context.WithValue(nctx, xcontext.PropagationType, xcontext.PortalPlatform)
-		ecsId, ok := podENICopy.Labels[types.AnnotationsENIECSID]
-		if !ok {
-			r.log.Error(fmt.Sprintf("podeni %s ecsId label is null", podENICopy.Name))
-			return reconcile.Result{}, fmt.Errorf("podeni %s ecsId label is null", podENICopy.Name)
-		}
-		isNumberic, azCode := utils.IsValidNumber(r.MSconfig.AzoneCode)
-		if !isNumberic {
-			r.log.Errorf("%s is not a vaild number", r.MSconfig.AzoneCode)
-			return reconcile.Result{}, fmt.Errorf("azcode %s is not a vaild number", r.MSconfig.AzoneCode)
-		}
-		err = r.msxfClient.AttachENI(nctx, &msxf.AttachNetworkInterfaceRequest{
-			ID:             podENICopy.Spec.ENI.ID,
-			AZoneCode:      azCode,
-			TenantID:       r.MSconfig.TenantID,
-			ServerID:       ecsId,
-			RequestId:      reuqestId,
-			CloudAccountID: r.MSconfig.CloudAccountID,
-		})
+		err = r.podENIattachENI(ctx, podENICopy)
 		if err != nil {
-			r.log.WithError(err).Error("attch eni failed.")
-			r.recordPodENIAttachErr(podENICopy, startTime, err)
+			r.log.Errorf("attchENI %s, err %s", podENI.Name, err.Error())
+			r.recordPodENIAttachErr(podENI, startTime, err)
 			return reconcile.Result{}, err
 		}
 		patchObj := client.MergeFrom(podENI)
@@ -580,8 +683,6 @@ func (r *PodENIReconciler) podENICreate(ctx context.Context, _ client.ObjectKey,
 
 		defer func() {
 			if err != nil {
-				//r.reduceNodeENIConfig(ctx, node.Name, podENICopy.Name)
-				//r.log.Infof("err %s, reduceENINum node %s", err, node.Name)
 				err = r.deleteENI(ctx, podENICopy)
 				if err != nil {
 					r.recordPodENIDeleteErr(podENICopy, startTime, err)
@@ -589,56 +690,8 @@ func (r *PodENIReconciler) podENICreate(ctx context.Context, _ client.ObjectKey,
 				}
 			}
 		}()
-		/*
-			err = r.increaseNodeENIConfig(ctx, node.Name, podENICopy.Name)
-			if err != nil {
-				r.recordPodENIUpdateErr(podENI, startTime, err)
-				if err.Error() == ErrorInsufficientENINUM {
-					return reconcile.Result{}, nil
-				}
-				r.log.WithError(err).Error("increase node eni config failed.")
-				return reconcile.Result{}, err
-			}
-		*/
-		requestId := utils.GenerateRequestId()
-		data := &xcontext.CloudPlatform{
-			Type: xcontext.PortalPlatform,
-			Portal: &xcontext.Portal{
-				RequestID:      requestId,
-				CloudAccountID: r.MSconfig.CloudAccountID,
-				TenantID:       r.MSconfig.TenantID,
-			},
-		}
-		nctx := xcontext.MockContext(ctx, data)
-		nctx = context.WithValue(nctx, xcontext.PropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
-		nctx = context.WithValue(nctx, xcontext.PropagationType, xcontext.PortalPlatform)
-
-		name := utils.GenerateENIName(podENICopy.Status.ECSID)
-
-		isNumberic, azCode := utils.IsValidNumber(r.MSconfig.AzoneCode)
-		if !isNumberic {
-			r.log.Errorf("%s is not a vaild number", r.MSconfig.AzoneCode)
-			return reconcile.Result{}, fmt.Errorf("azcode %s is not a vaild number", r.MSconfig.AzoneCode)
-		}
-		eni, err := r.msxfClient.AllocateENI(nctx, &msxf.CreateNetworkInterfaceRequest{
-			Name:            name,
-			Description:     fmt.Sprintf("Created by MCK %s VPC CNI", r.MSconfig.ClusterID),
-			TenantID:        r.MSconfig.TenantID,
-			RegionCode:      cast.ToInt(r.MSconfig.RegionCode),
-			AZoneCode:       azCode,
-			NetworkID:       r.MSconfig.VPCID,
-			SubnetID:        r.MSconfig.SubnetID,
-			SecurityGroups:  r.MSconfig.SecurityGroups,
-			OwnerType:       r.MSconfig.OwnerType,
-			CloudAccountID:  r.MSconfig.CloudAccountID,
-			ResourceGroupID: r.MSconfig.ResourceGroupID,
-			RequestId:       requestId,
-			GrUniqueID:      podENI.Name,
-			Type:            2,
-		})
+		eni, err := r.podENIAllocateENI(ctx, podENICopy, startTime)
 		if err != nil {
-			r.recordPodENICreateErr(podENICopy, startTime, err)
-			r.log.WithError(err).Error("create eni failed.")
 			return reconcile.Result{}, err
 		}
 		podENICopy.Spec.ENI.Description = eni.Description
@@ -669,17 +722,328 @@ func (r *PodENIReconciler) podENICreate(ctx context.Context, _ client.ObjectKey,
 	return reconcile.Result{}, nil
 }
 
-func (r *PodENIReconciler) podENIDelete(ctx context.Context, podENI *v1beta1.PodENI, startTime time.Time) (result reconcile.Result, err error) {
-	r.log.Infof("podENI delete %s, phase %s", podENI.Name, podENI.Status.Phase)
-
-	podENICopy := podENI.DeepCopy()
-	/*
-		node, err := r.getNode(ctx, podENICopy.Status.NodeName)
-		if err != nil {
-			r.log.Errorf("get node failed. %s", podENICopy.Status.NodeName)
-			return reconcile.Result{}, fmt.Errorf("error get node %s, %w", podENICopy.Status.NodeName, err)
+func RemoveStringSlice(secondaryIPs []msxf.ENISecondaryPrivateIP, ip string) []msxf.ENISecondaryPrivateIP {
+	res := secondaryIPs[:0]
+	for _, v := range secondaryIPs {
+		if v.IPAddress != ip {
+			res = append(res, v)
 		}
-	*/
+	}
+	return res
+}
+
+func (r *PodENIReconciler) podENIReleaseEniSecondaryIP(ctx context.Context, podENICopy *v1beta1.PodENI) error {
+	startTime := time.Now()
+	requestId := utils.GenerateRequestId()
+	data := &xcontext.CloudPlatform{
+		Type: xcontext.PortalPlatform,
+		Portal: &xcontext.Portal{
+			RequestID:      requestId,
+			CloudAccountID: r.MSconfig.CloudAccountID,
+			TenantID:       r.MSconfig.TenantID,
+		},
+	}
+	nctx := xcontext.MockContext(ctx, data)
+	nctx = context.WithValue(nctx, PlatformPropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
+	nctx = context.WithValue(nctx, CtxPropagationType, PPortalPlatform)
+
+	if podENICopy.Status.ENIID == "" {
+		r.log.Errorf("podeni %s eni is null", podENICopy.Name)
+		return errors.New("podeni eni id is null")
+	}
+
+	eniDetail, err := r.msxfClient.GetENIDetail(nctx, &msxf.DescribeNetworkInterfaceRequest{
+		ID:             podENICopy.Status.ENIID,
+		TenantID:       r.MSconfig.TenantID,
+		CloudAccountID: r.MSconfig.CloudAccountID,
+		RequestId:      requestId,
+	})
+	if err != nil {
+		r.recordPodENIReleaseSecondaryIPErr(podENICopy, startTime, err)
+		r.log.WithError(err).Error("allocated eni secondary ip failed.")
+		return err
+	}
+	secondaryIPs := eniDetail.SecondaryPrivateIPs
+	newSecondaryIPs := RemoveStringSlice(secondaryIPs, podENICopy.Spec.PodIPInfo.IPAddress)
+	var fixedIPs []msxf.FixedIPList
+
+	for _, secondaryIP := range newSecondaryIPs {
+		fixedIPs = append(fixedIPs, msxf.FixedIPList{
+			IPAddress: secondaryIP.IPAddress,
+			SubnetID:  secondaryIP.SubnetID,
+		})
+	}
+	r.log.Infof("podENIReleaseEniSecondaryIP: old %v, newSecondaryIPs %v, ipAddress %s", secondaryIPs, newSecondaryIPs, podENICopy.Spec.PodIPInfo.IPAddress)
+	_, err = r.msxfClient.HandleENISecondaryIP(nctx, &msxf.HandleENISecondaryIPRequest{
+		ID:       podENICopy.Status.ENIID,
+		FixedIPs: fixedIPs,
+	})
+	if err != nil {
+		r.log.WithError(err).Error("allocate eni secondary ip failed.")
+		return err
+	}
+	return err
+}
+
+func (r *PodENIReconciler) podENIAllocateEniSecondaryIP(ctx context.Context, podENICopy *v1beta1.PodENI) error {
+	var nodeMultiEniIPs int = 0
+	var eniID string
+	var eniAllocatedIPs int = 0
+
+	podNode := &v1beta1.PodNode{}
+	podENIList := &v1beta1.PodENIList{}
+	err := r.client.Get(ctx, k8stypes.NamespacedName{Name: podENICopy.Status.NodeName}, podNode)
+	if err != nil {
+		r.log.Errorf("podnode %s is not found. %s", podNode.Name, err)
+		return err
+	}
+	err = r.client.List(ctx, podENIList)
+	if err != nil {
+		r.log.Errorf("list podEni failed %s.", err)
+		return err
+	}
+	node := &corev1.Node{}
+	err = r.client.Get(ctx, k8stypes.NamespacedName{Name: podENICopy.Status.NodeName}, node)
+	if err != nil {
+		r.log.Errorf("node %s get info failed. %s", podENICopy.Status.NodeName, err)
+		return err
+	}
+	c := node.Status.Capacity[corev1.ResourceName(types.ENIResourceKey)]
+	totalEniNum := int(c.Value())
+	for _, podEni := range podENIList.Items {
+		if podEni.Status.NodeName == podENICopy.Status.NodeName {
+			nodeMultiEniIPs++
+		}
+	}
+	if nodeMultiEniIPs >= MaxAllocatableEniNums*totalEniNum {
+		return fmt.Errorf("podip had reach the max eni nums, %d", nodeMultiEniIPs)
+	}
+	podNodeCopy := podNode.DeepCopy()
+	r.log.Infof("podENIAllocateEniSecondaryIP: podeni %s", podENICopy.Name)
+	// eni上分配超过9个ip 需要使用新eni
+	for _, instance := range podNodeCopy.Status.NetworkInterfaces {
+		for _, podEni := range podENIList.Items {
+			if podEni.Spec.ENI.ID == instance.ID && podEni.Status.Phase == v1beta1.ENIPhaseIPAllocated {
+				r.log.Infof("podENIAllocateEniSecondaryIP: podeni %s, allocated %d, eni %s, node %s", podEni.Name, instance.Allocated, instance.ID, podNodeCopy.Name)
+				eniAllocatedIPs++
+			}
+		}
+		instance.Allocated = eniAllocatedIPs
+		r.log.Infof("podENIAllocateEniSecondaryIP: allocated %d, eni %s, node %s", instance.Allocated, instance.ID, podNodeCopy.Name)
+		eniAllocatedIPs = 0
+	}
+	eniID = podENICopy.Status.ENIID
+	for _index, instance := range podNodeCopy.Status.NetworkInterfaces {
+		if _index >= len(podNodeCopy.Status.NetworkInterfaces) {
+			return fmt.Errorf("podip had reach the max eni nums")
+		}
+		if instance.Allocated >= MaxAllocatableEniNums {
+			r.log.Infof("podENIAllocateEniSecondaryIP: eni index %d, eni id %s", _index, eniID)
+			continue
+		} else {
+			eniID = instance.ID
+			break
+		}
+	}
+	r.log.Infof("podENIAllocateEniSecondaryIP: finally get eni id %s", eniID)
+	requestId := utils.GenerateRequestId()
+	data := &xcontext.CloudPlatform{
+		Type: xcontext.PortalPlatform,
+		Portal: &xcontext.Portal{
+			RequestID:      requestId,
+			CloudAccountID: r.MSconfig.CloudAccountID,
+			TenantID:       r.MSconfig.TenantID,
+		},
+	}
+	nctx := xcontext.MockContext(ctx, data)
+	nctx = context.WithValue(nctx, PlatformPropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
+	nctx = context.WithValue(nctx, CtxPropagationType, PPortalPlatform)
+
+	eniDetail, err := r.msxfClient.GetENIDetail(nctx, &msxf.DescribeNetworkInterfaceRequest{
+		ID:             eniID,
+		TenantID:       r.MSconfig.TenantID,
+		CloudAccountID: r.MSconfig.CloudAccountID,
+		RequestId:      requestId,
+	})
+	if err != nil {
+		r.log.WithError(err).Error("get eni detail failed.")
+		return err
+	}
+	var secondaryIPTmpList []msxf.ENISecondaryPrivateIP
+	var fixedIPs []msxf.FixedIPList
+	var secondaryList, newSecondaryList []string
+	secondaryIPTmpList = eniDetail.SecondaryPrivateIPs
+	secondaryIPTmpList = append(secondaryIPTmpList, msxf.ENISecondaryPrivateIP{IPAddress: ""})
+
+	for _, secondaryIP := range eniDetail.SecondaryPrivateIPs {
+		secondaryList = append(secondaryList, secondaryIP.IPAddress)
+	}
+
+	for _, secondaryIP := range secondaryIPTmpList {
+		fixedIPs = append(fixedIPs, msxf.FixedIPList{
+			IPAddress: secondaryIP.IPAddress,
+			SubnetID:  secondaryIP.SubnetID,
+		})
+	}
+
+	ipsInfo, err := r.msxfClient.HandleENISecondaryIP(nctx, &msxf.HandleENISecondaryIPRequest{
+		ID:       eniID,
+		FixedIPs: fixedIPs,
+	})
+	if err != nil {
+		r.log.WithError(err).Error("allocate eni secondary ip failed.")
+		return err
+	}
+	newSecondaryIPs := ipsInfo.SecondaryPrivateIPs
+	for _, newSecondaryIP := range newSecondaryIPs {
+		newSecondaryList = append(newSecondaryList, newSecondaryIP.IPAddress)
+	}
+	r.log.Infof("ori second ip list %v, new second ip list %v", secondaryList, newSecondaryList)
+	ipList := utils.DiffStringSlice(newSecondaryList, secondaryList)
+	if len(ipList) > 1 {
+		return fmt.Errorf("allocated secondary ip is more than 1")
+	}
+	podENICopy.Spec.PodIPInfo.IPAddress = ipList[0]
+	podENICopy.Spec.PodIPInfo.SubnetID = eniDetail.Subnet.ID
+
+	podENICopy.Spec.ENI.ID = eniDetail.ID
+	podENICopy.Spec.ENI.IPAddress = eniDetail.IPAddress
+	podENICopy.Spec.ENI.Name = eniDetail.Name
+	podENICopy.Spec.ENI.MACAddress = eniDetail.MacAddress
+	podENICopy.Spec.ENI.SecurityGroups = eniDetail.SecurityGroups
+	podENICopy.Spec.ENI.Description = eniDetail.Description
+	podENICopy.Spec.ENI.PodCidr = eniDetail.Subnet.CIDR
+	podENICopy.Spec.ENI.GatewayIP = eniDetail.Subnet.GatewayIP
+	return nil
+}
+
+func (r *PodENIReconciler) podENICreateMultiEniIP(ctx context.Context, podENI *v1beta1.PodENI, startTime time.Time) (reconcile.Result, error) {
+	var exist bool
+	switch podENI.Status.Phase {
+	case v1beta1.ENIPhaseInitial:
+		var err error
+		exist, err = r.checkPodIsExist(ctx, k8stypes.NamespacedName{Namespace: podENI.Namespace, Name: podENI.Name})
+		if err != nil {
+			r.log.Infof("check pod %s failed, err %s", podENI.Name, err.Error())
+			return reconcile.Result{}, err
+		}
+
+		if !exist {
+			r.log.Infof("pod %s is not exist", podENI.Name)
+
+			podENICopy := podENI.DeepCopy()
+			patchObj := client.MergeFrom(podENI)
+			podENICopy.Status.Phase = v1beta1.ENIPhaseDeleting
+			err = r.client.Status().Patch(ctx, podENICopy, patchObj)
+			if err != nil {
+				r.log.Errorf("update podENI %s, err %s", podENI.Name, err.Error())
+				r.recordPodENIUpdateErr(podENI, startTime, err)
+			} else {
+				r.log.Infof("update podENI %s", podENI.Name)
+			}
+			return reconcile.Result{RequeueAfter: 10 * time.Millisecond}, nil
+		}
+
+		podENICopy := podENI.DeepCopy()
+		defer func() {
+			if err != nil {
+				errs := r.podENIReleaseEniSecondaryIP(ctx, podENICopy)
+				if errs != nil {
+					r.log.Errorf("release podENI secondary ip %s, err %s", podENI.Name, errs.Error())
+				}
+				r.recordPodENIReleaseSecondaryIPErr(podENICopy, startTime, err)
+			}
+		}()
+
+		err = r.podENIAllocateEniSecondaryIP(ctx, podENICopy)
+		if err != nil {
+			r.log.Errorf("allocate podENI secondary ip %s, err %s", podENI.Name, err.Error())
+			r.recordPodENIAllocatedSecondaryIPErr(podENICopy, startTime, err)
+			return reconcile.Result{}, err
+		}
+		pathObj := client.MergeFrom(podENI)
+		err = r.client.Patch(ctx, podENICopy, pathObj)
+		if err != nil {
+			r.log.Error(err, "patch podENI %s spec", podENI.Name)
+			r.recordPodENIUpdateErr(podENI, startTime, err)
+		} else {
+			r.log.Info("patch podENI spec")
+		}
+		podENICopy.Status.ENIID = podENICopy.Spec.ENI.ID
+		podENICopy.Status.Phase = v1beta1.ENIPhaseIPAllocated
+		err = r.client.Status().Patch(ctx, podENICopy, pathObj)
+		if err != nil {
+			r.log.Error(err, "patch podENI %s status", podENI.Name)
+			r.recordPodENIUpdateErr(podENI, startTime, err)
+		} else {
+			r.log.Infof("patch podENI %s status", podENI.Name)
+		}
+
+		return reconcile.Result{}, err
+	case v1beta1.ENIPhaseIPAllocated:
+		exist, err := r.checkPodIsExist(ctx, k8stypes.NamespacedName{Namespace: podENI.Namespace, Name: podENI.Name})
+		if err != nil {
+			r.log.Infof("check pod %s failed, err %s", podENI.Name, err.Error())
+			return reconcile.Result{}, err
+		}
+
+		if !exist {
+			r.log.Infof("pod %s is not exist", podENI.Name)
+
+			podENICopy := podENI.DeepCopy()
+			patchObj := client.MergeFrom(podENI)
+			podENICopy.Status.Phase = v1beta1.ENIPhaseDeleting
+			err = r.client.Status().Patch(ctx, podENICopy, patchObj)
+			if err != nil {
+				r.log.Errorf("update podENI %s, err %s", podENI.Name, err.Error())
+				r.recordPodENIUpdateErr(podENI, startTime, err)
+			} else {
+				r.log.Infof("update podENI %s", podENI.Name)
+			}
+			return reconcile.Result{RequeueAfter: 10 * time.Millisecond}, nil
+		}
+		r.log.Infof("%s already allocated secondary ip", podENI.Name)
+		return reconcile.Result{}, nil
+	case v1beta1.ENIPhaseDeleting:
+		r.log.Infof("delete podeni %s", podENI.Name)
+		err := r.client.Delete(ctx, podENI)
+		if err != nil {
+			if k8sErr.IsNotFound(err) {
+				r.log.Info("cr resource not found")
+				return reconcile.Result{}, nil
+			}
+			return reconcile.Result{}, err
+		}
+		return reconcile.Result{}, nil
+	}
+	return reconcile.Result{}, nil
+}
+
+func (r *PodENIReconciler) podENICreate(ctx context.Context, _ client.ObjectKey, podENI *v1beta1.PodENI, startTime time.Time) (result reconcile.Result, err error) {
+	r.log.Infof("podENI %s creating, phase %s", podENI.Name, podENI.Status.Phase)
+	mode := utils.GConfig.RunMode
+	r.log.Infof(" lira mode is %s", mode)
+
+	switch mode {
+	case utils.ExclusiveENI:
+		res, err := r.podENICreateExcusive(ctx, podENI, startTime)
+		if err != nil {
+			return res, err
+		}
+	case utils.MultiENIIP:
+		res, err := r.podENICreateMultiEniIP(ctx, podENI, startTime)
+		if err != nil {
+			return res, err
+		}
+	default:
+		r.log.Errorf("lira running mode is %s", mode)
+		return reconcile.Result{}, errors.New("lira mode is invalid")
+	}
+	return reconcile.Result{}, nil
+}
+
+func (r *PodENIReconciler) podENIExclusiveDelete(ctx context.Context, podENI *v1beta1.PodENI) (result reconcile.Result, err error) {
+
 	if podENI.Spec.ENI.ID != "" {
 		requestId := utils.GenerateRequestId()
 		data := &xcontext.CloudPlatform{
@@ -691,8 +1055,8 @@ func (r *PodENIReconciler) podENIDelete(ctx context.Context, podENI *v1beta1.Pod
 			},
 		}
 		nctx := xcontext.MockContext(ctx, data)
-		nctx = context.WithValue(nctx, xcontext.PropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
-		nctx = context.WithValue(nctx, xcontext.PropagationType, xcontext.PortalPlatform)
+		nctx = context.WithValue(nctx, PlatformPropagationKey, xcontext.MockPortalHeader(r.MSconfig.CloudAccountID, "", r.MSconfig.TenantID, requestId))
+		nctx = context.WithValue(nctx, CtxPropagationType, PPortalPlatform)
 
 		err = r.msxfClient.DetachENI(nctx, &msxf.DetachNetworkInterfaceRequest{
 			ID:             podENI.Spec.ENI.ID,
@@ -719,20 +1083,32 @@ func (r *PodENIReconciler) podENIDelete(ctx context.Context, podENI *v1beta1.Pod
 				return reconcile.Result{}, err
 			}
 		}
-		/*
-			err = r.reduceNodeENIConfig(ctx, node.Name, podENICopy.Name)
-			if err != nil {
-				r.log.Errorf("reduce node eniconfig failed. %s", podENICopy.Status.NodeName)
-				return reconcile.Result{}, fmt.Errorf("reduce node eniconfig failed %s, %w", podENICopy.Status.NodeName, err)
-			}
-		*/
+	}
+	return reconcile.Result{}, err
+}
+
+func (r *PodENIReconciler) podENIDelete(ctx context.Context, podENI *v1beta1.PodENI) (reconcile.Result, error) {
+	r.log.Infof("podENI delete %s, phase %s", podENI.Name, podENI.Status.Phase)
+	var err error
+	podENICopy := podENI.DeepCopy()
+	switch utils.GConfig.RunMode {
+	case utils.ExclusiveENI:
+		_, err = r.podENIExclusiveDelete(ctx, podENI)
+	case utils.MultiENIIP:
+		err = r.podENIReleaseEniSecondaryIP(ctx, podENI)
+	default:
+		r.log.Errorf("runmode is invaild")
+		return reconcile.Result{}, errors.New("runmode is invaild")
+	}
+	if err != nil {
+		return reconcile.Result{}, err
 	}
 	controllerutil.RemoveFinalizer(podENICopy, types.FinalizerPodENI)
 	err = r.client.Update(ctx, podENICopy)
 	if k8sErr.IsNotFound(err) {
 		return reconcile.Result{}, nil
 	}
-	return reconcile.Result{}, err
+	return reconcile.Result{}, nil
 }
 
 func (r *PodENIReconciler) recordPodENIUpdateErr(podEni *v1beta1.PodENI, startTime time.Time, err error) {
@@ -793,4 +1169,28 @@ func (r *PodENIReconciler) recordPodENICreateErr(podEni *v1beta1.PodENI, startTi
 	}
 	r.record.Eventf(pod, corev1.EventTypeWarning,
 		"CniCreateENIError", fmt.Sprintf("CniCreateENIError: %s, elapsedTime: %s", err, time.Since(startTime)))
+}
+
+func (r *PodENIReconciler) recordPodENIAllocatedSecondaryIPErr(podEni *v1beta1.PodENI, startTime time.Time, err error) {
+	if err == nil {
+		return
+	}
+	var pod = &corev1.Pod{}
+	if getErr := r.client.Get(context.Background(), k8stypes.NamespacedName{Namespace: podEni.Namespace, Name: podEni.Name}, pod); getErr != nil {
+		return
+	}
+	r.record.Eventf(pod, corev1.EventTypeWarning,
+		"CniAllocatedENISecondaryIPError", fmt.Sprintf("CniAllocatedENISecondaryIPError: %s, elapsedTime: %s", err, time.Since(startTime)))
+}
+
+func (r *PodENIReconciler) recordPodENIReleaseSecondaryIPErr(podEni *v1beta1.PodENI, startTime time.Time, err error) {
+	if err == nil {
+		return
+	}
+	var pod = &corev1.Pod{}
+	if getErr := r.client.Get(context.Background(), k8stypes.NamespacedName{Namespace: podEni.Namespace, Name: podEni.Name}, pod); getErr != nil {
+		return
+	}
+	r.record.Eventf(pod, corev1.EventTypeWarning,
+		"CniReleaseSecondaryIPError", fmt.Sprintf("CniReleaseSecondaryIPError: %s, elapsedTime: %s", err, time.Since(startTime)))
 }

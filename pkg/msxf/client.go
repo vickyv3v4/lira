@@ -3,14 +3,45 @@ package msxf
 import (
 	"context"
 
-	"gitlab.msxf.com/mscloud/cloud-infrastructure-sdk/v2/lib/xcontext"
+	"golang.org/x/time/rate"
 )
+
+type PropagationType string
+
+const (
+	CtxPropagationType     PropagationType = "ctx-type"
+	PPortalPlatform        PropagationType = "portal"
+	PlatformPropagationKey PropagationType = "platform-ctx"
+)
+
+var defaultLimit = map[string]int{
+	"":                          3,
+	"AttachNetworkInterface":    2,
+	"CreateNetworkInterface":    2,
+	"DeleteNetworkInterface":    2,
+	"DescribeNetworkInterfaces": 2,
+}
+
+type RateLimiter struct {
+	rateList map[string]*rate.Limiter
+}
+
+func NewRateLimiter() *RateLimiter {
+	r := &RateLimiter{
+		rateList: make(map[string]*rate.Limiter),
+	}
+	for k, v := range defaultLimit {
+		r.rateList[k] = rate.NewLimiter(rate.Limit(float64(v)/60), v)
+	}
+
+	return r
+}
 
 type MsxfClient struct {
 	APIUrl string
 }
 
-func NewMsxfClient(url string) *MsxfClient {
+func NewMsxfClient(url string) MsxfClientAPI {
 	return &MsxfClient{
 		APIUrl: url,
 	}
@@ -49,20 +80,17 @@ func (m *MsxfClient) GetENIDetail(ctx context.Context, req *DescribeNetworkInter
 	var subnetDetail *ENI
 	var err error
 
-	data := &xcontext.CloudPlatform{
-		Type: xcontext.PortalPlatform,
-		Portal: &xcontext.Portal{
-			RequestID:      req.RequestId,
-			CloudAccountID: req.CloudAccountID,
-			TenantID:       req.TenantID,
-		},
-	}
-	nctx := xcontext.MockContext(ctx, data)
-	nctx = context.WithValue(nctx, xcontext.PropagationKey, xcontext.MockPortalHeader(req.CloudAccountID, "", req.TenantID, req.RequestId))
-	nctx = context.WithValue(nctx, xcontext.PropagationType, xcontext.PortalPlatform)
-
-	if subnetDetail, err = DescribeNetworkInterface(nctx, m.APIUrl, req); err != nil {
+	if subnetDetail, err = DescribeNetworkInterface(ctx, m.APIUrl, req); err != nil {
 		return nil, err
 	}
 	return subnetDetail, nil
+}
+
+func (m *MsxfClient) HandleENISecondaryIP(ctx context.Context, req *HandleENISecondaryIPRequest) (*SecondaryIPsInfo, error) {
+	var err error
+	var ipsInfo *SecondaryIPsInfo
+	if ipsInfo, err = HandleMultiENISecondaryIP(ctx, m.APIUrl, req); err != nil {
+		return nil, err
+	}
+	return ipsInfo, nil
 }

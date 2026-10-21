@@ -20,6 +20,9 @@ func VethNameForPod(name, namespace, ifName, prefix string) (string, error) {
 
 	return "", nil
 }
+func IPVlanTmpNameForPod(name, namespace, prefix string) (string, error) {
+	return "", nil
+}
 func DeleteVethRoute(hostVethName string, ip *net.IP) error {
 	return nil
 }
@@ -27,5 +30,8 @@ func DeleteVeth(hostVethName string) error {
 	return nil
 }
 func EnsureHostNsConfig() error {
+	return nil
+}
+func DeleteVethNeigh(hostVethName string, ip *net.IP) error {
 	return nil
 }
