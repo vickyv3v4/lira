@@ -99,6 +99,13 @@ func Run(ctx context.Context, socketFilePath string) error {
 		return err
 	}
 
+	// eBPF 网络策略子系统（设计 §5）：初始化失败仅禁用功能，不影响 CNI 主流程
+	k8sObj := svc.GetK8s()
+	if mgr := newPolicyBackend(k8sObj); mgr != nil {
+		svc.SetPolicyBackend(mgr)
+		go runNetworkPolicy(ctx, mgr, k8sObj)
+	}
+
 	grpcServer := grpc.NewServer()
 	rpc.RegisterLiraBackendServer(grpcServer, svc)
 	stop := make(chan struct{})

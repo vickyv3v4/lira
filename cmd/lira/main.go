@@ -14,6 +14,7 @@ import (
 	"github.com/containernetworking/cni/pkg/version"
 
 	"gitlab.msxf.com/mscloud/lira/pkg/cni"
+	"gitlab.msxf.com/mscloud/lira/pkg/ebpf"
 	"gitlab.msxf.com/mscloud/lira/pkg/link"
 	"gitlab.msxf.com/mscloud/lira/pkg/llog"
 	"gitlab.msxf.com/mscloud/lira/pkg/rpc"
@@ -141,6 +142,12 @@ func cmdAdd(args *skel.CmdArgs) error {
 	if err != nil {
 		log.Error(err, "failed to EnsureHostNsConfig")
 		return err
+	}
+
+	// eBPF 网络策略（设计 §5.1）：挂载 ③④ 程序 + 写 slave_src 防伪造白名单。
+	// 失败不阻断建链 —— ENI 主口 ①② 程序仍在强制执行策略，仅缺少 pod 口本地过滤。
+	if err := ebpf.AttachPod(cmdArgs.GetNetNSPath(), config.PodIfName, hostVethName, podIPNet); err != nil {
+		log.Warn("ebpf: attach pod filters failed, policy still enforced at ENI main port, ", err)
 	}
 
 	result := &current.Result{}
@@ -276,6 +283,9 @@ func doCmdDel(ctx context.Context, cmdArgs *cni.CniCmdArgs) error {
 		return err
 	}
 	log.Infof("hostVethName: %s", hostVethName)
+
+	// eBPF 清理（尽力而为：netns 已销毁时自动跳过；slave_src 由 ifindex 键控须显式删除）
+	ebpf.DetachPod(cmdArgs.GetNetNSPath(), cmdArgs.InputArgs.IfName, hostVethName)
 
 	runMode := cniConf.RunMode
 	switch utils.LiraIPMode(runMode) {

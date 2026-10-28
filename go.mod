@@ -10,6 +10,7 @@ require (
 
 require (
 	github.com/alexflint/go-filemutex v1.3.0
+	github.com/cilium/ebpf v0.12.3
 	github.com/containernetworking/cni v1.1.2
 	github.com/containernetworking/plugins v1.3.0
 	github.com/go-logr/logr v1.4.2

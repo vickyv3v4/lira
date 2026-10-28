@@ -9,6 +9,12 @@ chmod +x /opt/cni/bin/lira
 
 \cp -f /01-lira.conflist /etc/cni/net.d/01-lira.conflist
 
+# eBPF 数据面对象（网络策略功能启用时存在；init 容器安装到宿主机固定路径）
+mkdir -p /opt/cni/lira/
+if [ -f /lira.bpf.o ]; then
+  \cp -f /lira.bpf.o /opt/cni/lira/lira.bpf.o
+fi
+
 masq_eni_only() {
   echo "exec iptables configure lira-masq"
   if ! "$1" -t nat -L lira-masq; then

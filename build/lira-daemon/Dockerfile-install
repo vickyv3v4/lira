@@ -18,5 +18,7 @@ RUN chmod +x /lira
 COPY --from=builder /workspace/scripts/install-cni.sh .
 RUN chmod +x /install-cni.sh
 COPY --from=builder /workspace/01-lira.conflist .
+# eBPF 数据面对象：init 容器安装到宿主机 /opt/cni/lira/lira.bpf.o
+COPY --from=builder /workspace/bin/lira.bpf.o .
 USER 65532:65532
 

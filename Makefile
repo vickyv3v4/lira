@@ -62,6 +62,21 @@ all: generate fmt vet lira lira-daemon lira-controller lira-resource
 lira:
 	CGO_ENABLED=0 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/lira cmd/lira/main.go
 
+# build-bpf 编译 eBPF 数据面（bpf/lira.bpf.c → bin/lira.bpf.o）。
+# 需要 clang ≥ 10（推荐 12+）且带 BPF 后端；产物随 init-cni 容器安装到宿主机
+# /opt/cni/lira/lira.bpf.o，由 daemon 按需加载。
+.PHONY: build-bpf
+build-bpf:
+	mkdir -p bin
+	clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -c bpf/lira.bpf.c -I bpf -o bin/lira.bpf.o
+
+# build-bpf-docker 无本地 clang 环境时的容器化构建
+.PHONY: build-bpf-docker
+build-bpf-docker:
+	docker run --rm -v $(CURDIR):/src -w /src \
+		quay.io/cilium/ebpf-builder:bpf-builder-1600480382 \
+		bash -c "clang -O2 -g -target bpf -D__TARGET_ARCH_x86 -c bpf/lira.bpf.c -I bpf -o bin/lira.bpf.o && chown -R $(shell id -u):$(shell id -g) bin"
+
 .PHONY: lira-daemon
 lira-daemon:
 	CGO_ENABLED=0 GOOS=$(OS) GOARCH=$(ARCH) go build -o bin/lira-daemon cmd/lira-daemon/main.go

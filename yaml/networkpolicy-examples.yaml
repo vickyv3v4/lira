@@ -1,0 +1,86 @@
+# NetworkPolicy 示例（K8s 标准 API，lira eBPF 数据面按其语义在节点上执行）
+# 适用前提：lira-daemon 已部署且节点上存在 /opt/cni/lira/lira.bpf.o（功能启用）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: prod
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+# 仅放行同命名空间内带 app=frontend 标签的 pod 以 TCP 访问 8080，以及 DNS 出向
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: prod
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - protocol: TCP
+          port: 8080
+    - to: []            # 空对端 = 放行全部对端（仅 DNS 端口）
+      ports:
+        - protocol: UDP
+          port: 53
+---
+# 跨命名空间：允许 monitoring 命名空间抓取 /metrics
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scrape
+  namespace: prod
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app: prometheus
+      ports:
+        - protocol: TCP
+          port: 9090
+---
+# ipBlock + except（except 网段自动展开为剩余子网集合）
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-office-egress
+  namespace: prod
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 10.0.0.0/8
+            except:
+              - 10.96.0.0/12
+      ports:
+        - protocol: TCP
+          port: 443

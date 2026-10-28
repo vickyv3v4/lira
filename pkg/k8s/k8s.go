@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"sync"
 
@@ -22,6 +23,9 @@ import (
 
 type Kubernetes interface {
 	GetPodENI(ctx context.Context, namespace, name string) (*networkv1beta1.PodENI, error)
+	ListPodENIs(ctx context.Context) ([]*networkv1beta1.PodENI, error)
+	GetPodObj(ctx context.Context, namespace, name string) (*corev1.Pod, error)
+	NodeIP() net.IP
 	RecordPodEvent(ctx context.Context, podName, podNamespace, eventType, reason, message string) error
 	GetConfigMap(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error)
 }
@@ -78,6 +82,40 @@ func (k *k8s) GetPodENI(ctx context.Context, namespace, name string) (*networkv1
 }
 func (k *k8s) GetPod(ctx context.Context, namespace, name string, cache bool) (*types.PodInfo, error) {
 	return nil, nil
+}
+
+// ListPodENIs 全量列出 PodENI（网络策略 agent 周期 reconcile 按 Status.NodeName 过滤本节点）
+func (k *k8s) ListPodENIs(ctx context.Context) ([]*networkv1beta1.PodENI, error) {
+	list := &networkv1beta1.PodENIList{}
+	if err := k.client.List(ctx, list); err != nil {
+		return nil, err
+	}
+	out := make([]*networkv1beta1.PodENI, 0, len(list.Items))
+	for i := range list.Items {
+		out = append(out, &list.Items[i])
+	}
+	return out, nil
+}
+
+// GetPodObj 读取 Pod 原始对象（AllocIP 需要标签计算身份）
+func (k *k8s) GetPodObj(ctx context.Context, namespace, name string) (*corev1.Pod, error) {
+	pod := &corev1.Pod{}
+	err := k.client.Get(ctx, k8stypes.NamespacedName{Namespace: namespace, Name: name}, pod)
+	return pod, err
+}
+
+// NodeIP 返回节点内部 IP（ebpf 数据面节点旁路用），无 InternalIP 时退回 ExternalIP
+func (k *k8s) NodeIP() net.IP {
+	var ext net.IP
+	for _, addr := range k.node.Status.Addresses {
+		switch addr.Type {
+		case corev1.NodeInternalIP:
+			return net.ParseIP(addr.Address)
+		case corev1.NodeExternalIP:
+			ext = net.ParseIP(addr.Address)
+		}
+	}
+	return ext
 }
 func (k *k8s) GetConfigMap(ctx context.Context, namespace, name string) (*corev1.ConfigMap, error) {
 	cm := &corev1.ConfigMap{}
